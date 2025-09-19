@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from retriever import Retriever  # 의미 기반 검색기
+from retriever import Retriever  # 새로운 의미 기반 검색기
 
 # ──────────────────────────
 # 콘솔 스피너 (즉시 피드백)
@@ -95,9 +95,9 @@ class LNPChat:
         answer_lines = [f"‘{query}’와(과) 의미상 유사한 문서 Top {len(hits)} (검색 {dt:.2f}s):"]
         for i, h in enumerate(hits, 1):
             sim = f"{h['similarity']:.3f}"
-            answer_lines.append(f"{i}. {h['path']} [{h['ext']}]  유사도={sim}")
-            if h.get("preview"):
-                answer_lines.append(f"   미리보기: {h['preview']}")
+            answer_lines.append(f"{i}. {h['path']}  (유사도: {sim})")
+            if h.get("summary"):
+                answer_lines.append(f"   요약: {h['summary']}")
         if not hits:
             answer_lines.append("관련 문서를 찾지 못했습니다. 표현을 바꿔보거나 더 구체적으로 적어주세요.")
 
@@ -109,11 +109,17 @@ class LNPChat:
 
     # 후속 질문 제안
     def _suggest_followups(self, query: str, hits: List[Dict[str, Any]]) -> List[str]:
-        base: List[str] = []
+        base = []
         if hits:
-            base.append("이 문서들의 핵심 내용을 요약해줘")
+            base.append("이 문서의 핵심 내용을 요약해줘")
             base.append("위 문서들과 비슷한 다른 문서를 더 찾아줘")
-            base.append("1번 문서를 자세히 설명해줘")
+            base.append("결과를 표 형식으로 정리해줘")
         else:
-            base.append("질문을 더 구체적으로 적어볼래? (예: 기간/제품/부서)")
-        return base[:5]
+            base.append("다른 표현으로 같은 의미의 질의를 시도")
+            base.append("문서 유형(엑셀/한글/PDF 등)을 지정해서 검색")
+        
+        seen, out = set(), []
+        for s in base:
+            if s not in seen:
+                out.append(s); seen.add(s)
+        return out[:3]
