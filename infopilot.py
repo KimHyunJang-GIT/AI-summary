@@ -43,6 +43,20 @@ def cmd_train(args):
     cb.save(df_corpus, corpus_path)
     print(f"💾 코퍼스 저장 완료: {corpus_path}")
 
+    # --- 추가: 성공/실패 파일 분리 저장 --- #
+    output_dir = corpus_path.parent # data/ 폴더 경로
+    
+    df_success = df_corpus[df_corpus['ok']]
+    success_path = output_dir / "corpus_success.csv"
+    df_success.to_csv(success_path, index=False, encoding="utf-8")
+    print(f"✅ 성공적으로 처리된 문서 저장: {success_path} ({len(df_success)}개)")
+
+    df_failure = df_corpus[~df_corpus['ok']]
+    failure_path = output_dir / "corpus_failure.csv"
+    df_failure.to_csv(failure_path, index=False, encoding="utf-8")
+    print(f"❌ 처리 실패 문서 저장: {failure_path} ({len(df_failure)}개)")
+    # --- 추가 끝 --- #
+
     # 2. 생성된 코퍼스를 기반으로 인덱싱 실행
     run_indexing(corpus_path=corpus_path, cache_dir=Path(args.cache))
 

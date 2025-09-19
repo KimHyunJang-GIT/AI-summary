@@ -39,7 +39,7 @@ class StartupSpinner:
 
 class FileFinder:
     DEFAULT_EXTS = {
-        ".hwp", ".doc",
+        ".hwp", ".doc", ".docx"
         ".xlsx", ".xls", ".xlsm", ".xlsb", ".xltx",
         ".pdf",
         ".ppt", ".pptx",
