@@ -1,0 +1,11 @@
+streamlit
+pandas
+joblib
+tqdm
+# your extraction stack (adjust based on your current pipeline.py)
+python-docx
+python-pptx
+pymupdf
+sentence-transformers
+pywebview
+waitress
