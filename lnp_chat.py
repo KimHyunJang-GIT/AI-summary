@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 LNP Chat: 자연어 대화로 문서 검색/추천
-- Retriever(코퍼스/인덱스)를 사용해 사용자 질의 → 유사 문서 Top-K
-- 간단한 대화 히스토리, 진행 스피너, 후속질문 제안 포함
+- 유사도 임계값 필터링 및 맞춤형 '결과 없음' 메시지 기능 추가
 """
 from __future__ import annotations
 import time
@@ -53,7 +52,8 @@ class ChatTurn:
 class LNPChat:
     corpus_path: Path
     cache_dir: Path = Path("./index_cache")
-    topk: int = 5
+    topk: int = 10
+    similarity_threshold: float = 0.05 # 유사도 임계값 설정
 
     retr: Optional[Retriever] = field(init=False, default=None)
     history: List[ChatTurn] = field(init=False, default_factory=list)
@@ -84,27 +84,37 @@ class LNPChat:
         spin.start()
         t0 = time.time()
         try:
-            hits = self.retr.search(query, top_k=k)
+            # 1. Retriever는 일단 가능한 많은 후보를 가져옴 (topk * 2, 최소 20개)
+            candidate_hits = self.retr.search(query, top_k=max(k * 2, 20))
         finally:
             spin.stop()
         dt = time.time() - t0
 
-        self.history.append(ChatTurn(role="user", text=query))
-        self.history.append(ChatTurn(role="assistant", text="", hits=hits))
+        # 2. 유사도 임계값(0.05)을 기준으로 필터링
+        filtered_hits = [h for h in candidate_hits if h['similarity'] >= self.similarity_threshold]
+        
+        # 3. 최종 결과는 필터링된 것에서 topk 만큼만 잘라서 사용
+        final_hits = filtered_hits[:k]
 
-        answer_lines = [f"‘{query}’와(과) 의미상 유사한 문서 Top {len(hits)} (검색 {dt:.2f}s):"]
-        for i, h in enumerate(hits, 1):
-            sim = f"{h['similarity']:.3f}"
-            answer_lines.append(f"{i}. {h['path']}  (유사도: {sim})")
-            if h.get("summary"):
-                answer_lines.append(f"   요약: {h['summary']}")
-        if not hits:
-            answer_lines.append("관련 문서를 찾지 못했습니다. 표현을 바꿔보거나 더 구체적으로 적어주세요.")
+        self.history.append(ChatTurn(role="user", text=query))
+        self.history.append(ChatTurn(role="assistant", text="", hits=final_hits))
+
+        # 4. 필터링된 결과(final_hits)를 기반으로 답변 생성
+        if not final_hits:
+            # 기준을 통과한 문서가 하나도 없을 경우, 요청하신 메시지 표시
+            answer_lines = [f"‘{query}’와 관련된 내용을 찾지 못했습니다."]
+        else:
+            answer_lines = [f"‘{query}’와(과) 의미상 유사한 문서 Top {len(final_hits)} (검색 {dt:.2f}s):"]
+            for i, h in enumerate(final_hits, 1):
+                sim = f"{h['similarity']:.3f}"
+                answer_lines.append(f"{i}. {h['path']}  (유사도: {sim})")
+                if h.get("summary"):
+                    answer_lines.append(f"   요약: {h['summary']}")
 
         return {
             "answer": "\n".join(answer_lines),
-            "hits": hits,
-            "suggestions": self._suggest_followups(query, hits),
+            "hits": final_hits,
+            "suggestions": self._suggest_followups(query, final_hits),
         }
 
     # 후속 질문 제안
