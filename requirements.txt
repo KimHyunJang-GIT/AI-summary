@@ -5,7 +5,16 @@ tqdm
 # your extraction stack (adjust based on your current pipeline.py)
 python-docx
 python-pptx
+pyhwp
+pywin32
+pypandoc
 pymupdf
 sentence-transformers
 pywebview
 waitress
+PyPDF2
+Pillow
+openpyxl
+xlrd
+EasyOCR
+pyinstaller
