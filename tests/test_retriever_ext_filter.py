@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import types
@@ -40,7 +41,7 @@ except ModuleNotFoundError:  # pytest 미설치 환경 대비
 
     pytest = types.SimpleNamespace(mark=_Mark())
 
-from retriever import Retriever
+from retriever import Retriever, _metadata_text
 
 
 def _make_stub_retriever() -> Retriever:
@@ -48,8 +49,12 @@ def _make_stub_retriever() -> Retriever:
     retr.model_path = Path("dummy_model.joblib")
     retr.corpus_path = Path("dummy_corpus.csv")
     retr.cache_dir = Path("dummy_cache")
+    def _encode_query(query: str):
+        retr._last_query = query
+        return query
+
     retr.encoder = SimpleNamespace(
-        encode_query=lambda query: query,
+        encode_query=_encode_query,
         encode_docs=lambda docs: docs,
     )
 
@@ -65,23 +70,44 @@ def _make_stub_retriever() -> Retriever:
                 ".doc",
                 ".hwp",
             ]
+            now = time.time()
+            year = 365 * 24 * 3600
             self._hits = [
-                {"path": "xlsx_doc", "ext": ".xlsx", "similarity": 0.99, "preview": ""},
-                {"path": "pdf_doc_one", "ext": ".pdf", "similarity": 0.95, "preview": ""},
-                {"path": "pdf_doc_two", "ext": ".pdf", "similarity": 0.94, "preview": ""},
-                {"path": "xlsm_budget", "ext": ".xlsm", "similarity": 0.93, "preview": ""},
-                {"path": "docx_doc", "ext": ".docx", "similarity": 0.92, "preview": ""},
-                {"path": "pptx_deck", "ext": ".pptx", "similarity": 0.91, "preview": ""},
-                {"path": "doc_report", "ext": ".doc", "similarity": 0.90, "preview": ""},
-                {"path": "hwp_contract", "ext": ".hwp", "similarity": 0.89, "preview": ""},
+                {"path": "xlsx_doc", "ext": ".xlsx", "similarity": 0.99, "preview": "", "mtime": now - (0.1 * year), "size": 5_000},
+                {"path": "pdf_doc_one", "ext": ".pdf", "similarity": 0.95, "preview": "", "mtime": now - (0.2 * year), "size": 20_000},
+                {"path": "pdf_doc_two", "ext": ".pdf", "similarity": 0.94, "preview": "", "mtime": now - (1.1 * year), "size": 18_000},
+                {"path": "xlsm_budget", "ext": ".xlsm", "similarity": 0.93, "preview": "", "mtime": now - (2.0 * year), "size": 35_000},
+                {"path": "docx_doc", "ext": ".docx", "similarity": 0.92, "preview": "", "mtime": now - (3.1 * year), "size": 12_000},
+                {"path": "pptx_deck", "ext": ".pptx", "similarity": 0.91, "preview": "", "mtime": now - (4.5 * year), "size": 8_000},
+                {"path": "doc_report", "ext": ".doc", "similarity": 0.90, "preview": "", "mtime": now - (5.0 * year), "size": 16_000},
+                {"path": "hwp_contract", "ext": ".hwp", "similarity": 0.89, "preview": "", "mtime": now - (6.0 * year), "size": 14_000},
             ]
 
         def search(self, _qvec, top_k: int, oversample: int = 1):
             fetch = max(1, min(len(self._hits), top_k * max(1, oversample)))
             return self._hits[:fetch]
 
-    retr.index = SimpleIndex()
-    retr._ready = True
+    simple_index = SimpleIndex()
+
+    class StubIndexManager:
+        def __init__(self, index):
+            self._index = index
+
+        def ensure_loaded(self):
+            return self._index
+
+        def schedule_rebuild(self, priority: bool = False):
+            return None
+
+        def wait_until_ready(self, timeout=None):
+            return True
+
+        def get_index(self, wait: bool = False, timeout=None):
+            return self._index
+
+    retr.index_manager = StubIndexManager(simple_index)
+    retr.index = simple_index  # 편의상 노출 (기존 테스트 호환)
+    retr.search_wait_timeout = 0.0
     return retr
 
 
@@ -102,6 +128,15 @@ def test_query_without_extension_keeps_original_order():
     assert hits[0]["ext"] == ".xlsx"
 
 
+@pytest.mark.smoke
+def test_semantic_query_expansion_hits_expected_extensions():
+    retr = _make_stub_retriever()
+    hits = retr.search("계약서 보여줘", top_k=2)
+    expanded_query = getattr(retr, "_last_query", "")
+    assert "contract" in expanded_query or "agreement" in expanded_query
+    assert hits[0]["ext"] in {".pdf", ".hwp"}
+
+
 @pytest.mark.parametrize(
     "query, expected_exts",
     [
@@ -117,3 +152,37 @@ def test_extension_synonym_queries_prioritise_expected_type(query, expected_exts
     hits = retr.search(query, top_k=2)
     assert hits, "검색 결과가 비어있습니다."
     assert hits[0]["ext"] in expected_exts
+
+
+@pytest.mark.smoke
+def test_metadata_text_includes_extension_context_keywords():
+    metadata = _metadata_text("팀/분기_계획.pptx", ".pptx", "driveA")
+    assert "pptx" in metadata
+    assert "파워포인트" in metadata
+    assert "presentation" in metadata
+
+
+@pytest.mark.smoke
+def test_filename_overlap_boosts_results_without_explicit_extension():
+    retr = _make_stub_retriever()
+    retr.index._hits = [
+        {"path": "random_notes.txt", "ext": ".txt", "similarity": 0.99, "preview": ""},
+        {"path": "연간 계획.docx", "ext": ".docx", "similarity": 0.88, "preview": ""},
+        {"path": "yearly_budget.xlsx", "ext": ".xlsx", "similarity": 0.85, "preview": ""},
+    ]
+    retr.index.exts = [hit["ext"] for hit in retr.index._hits]
+
+    hits = retr.search("연간 계획 자료", top_k=2)
+    assert hits[0]["path"] == "연간 계획.docx"
+    assert hits[0]["score"] >= hits[1]["score"]
+
+
+@pytest.mark.smoke
+def test_metadata_filters_recognise_relative_year():
+    retr = _make_stub_retriever()
+    now = time.time()
+    # Make only one document fall within 3 years ago window
+    retr.index._hits[4]["mtime"] = now - (3 * 365 * 24 * 3600)
+    retr.index._hits[5]["mtime"] = now - (6 * 365 * 24 * 3600)
+    hits = retr.search("3년 전 작성한 자료", top_k=3)
+    assert hits and hits[0]["path"] == "docx_doc"

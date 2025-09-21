@@ -11,7 +11,7 @@ import csv
 
 # 모듈 임포트
 from filefinder import FileFinder
-from pipeline import run_step2, TrainConfig, DEFAULT_N_COMPONENTS
+from pipeline import run_step2, TrainConfig, DEFAULT_N_COMPONENTS, DEFAULT_EMBED_MODEL
 from lnp_chat import LNPChat # 새로운 LNP Chat 클래스를 임포트
 
 
@@ -19,8 +19,10 @@ NORMALIZED_ALIASES = {
     "path": ("path", "filepath", "file_path", "fullpath", "full_path", "absolute_path"),
     "size": ("size", "filesize", "file_size", "bytes"),
     "mtime": ("mtime", "modified", "modified_time", "lastmodified", "timestamp"),
+    "ctime": ("ctime", "created", "created_time", "creation", "creation_time"),
     "ext": ("ext", "extension", "suffix"),
     "drive": ("drive", "volume", "root"),
+    "owner": ("owner", "user", "username", "author", "created_by"),
 }
 
 
@@ -53,6 +55,8 @@ def _normalize_scan_row(raw: Dict[str, str], *, context: str = "") -> Dict[str, 
     mtime_raw = _pick_value(raw, NORMALIZED_ALIASES["mtime"])
     ext = _pick_value(raw, NORMALIZED_ALIASES["ext"])
     drive = _pick_value(raw, NORMALIZED_ALIASES["drive"])
+    ctime_raw = _pick_value(raw, NORMALIZED_ALIASES["ctime"])
+    owner = _pick_value(raw, NORMALIZED_ALIASES["owner"])
 
     def to_int(value: str) -> int:
         try:
@@ -73,10 +77,13 @@ def _normalize_scan_row(raw: Dict[str, str], *, context: str = "") -> Dict[str, 
     normalized["path"] = path
     normalized["size"] = to_int(size_raw)
     normalized["mtime"] = to_float(mtime_raw)
+    normalized["ctime"] = to_float(ctime_raw)
     if ext:
         normalized["ext"] = ext
     if drive:
         normalized["drive"] = drive
+    if owner:
+        normalized["owner"] = owner
     return normalized
 
 
@@ -163,6 +170,9 @@ def _build_train_config(args) -> TrainConfig:
         ngram_range=(1, 2),
         min_df=args.min_df,
         max_df=args.max_df,
+        use_sentence_transformer=getattr(args, "use_embedding", True),
+        embedding_model=getattr(args, "embedding_model", DEFAULT_EMBED_MODEL),
+        embedding_batch_size=getattr(args, "embedding_batch_size", 32),
     )
 
 
@@ -181,6 +191,9 @@ def _default_train_config() -> TrainConfig:
         ngram_range=(1, 2),
         min_df=2,
         max_df=0.85,
+        use_sentence_transformer=True,
+        embedding_model=DEFAULT_EMBED_MODEL,
+        embedding_batch_size=32,
     )
 
 
@@ -352,6 +365,8 @@ def main():
     ap_train.add_argument("--n_clusters", type=int, default=25)
     ap_train.add_argument("--min_df", type=int, default=2)
     ap_train.add_argument("--max_df", type=float, default=0.85)
+    ap_train.add_argument("--embedding-model", default=DEFAULT_EMBED_MODEL, help="Sentence-BERT 임베딩 모델 이름")
+    ap_train.add_argument("--embedding-batch-size", type=int, default=32, help="Sentence-BERT 배치 크기")
     ap_train.add_argument(
         "--limit",
         "--limit-files",
@@ -361,7 +376,9 @@ def main():
         help="테스트용으로 상위 N개 파일만 사용합니다 (0=전체).",
     )
     ap_train.add_argument("--no-translate", dest="translate", action="store_false", help="번역 기능을 비활성화하고 원문으로 학습합니다.")
+    ap_train.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
     ap_train.set_defaults(translate=True)
+    ap_train.set_defaults(use_embedding=True)
     ap_train.set_defaults(func=cmd_train)
 
     # pipeline
@@ -381,6 +398,8 @@ def main():
     ap_pipe.add_argument("--n_clusters", type=int, default=25)
     ap_pipe.add_argument("--min_df", type=int, default=2)
     ap_pipe.add_argument("--max_df", type=float, default=0.85)
+    ap_pipe.add_argument("--embedding-model", default=DEFAULT_EMBED_MODEL, help="Sentence-BERT 임베딩 모델 이름")
+    ap_pipe.add_argument("--embedding-batch-size", type=int, default=32, help="Sentence-BERT 배치 크기")
     ap_pipe.add_argument(
         "--limit",
         "--limit-files",
@@ -390,7 +409,9 @@ def main():
         help="테스트용으로 상위 N개 파일만 사용합니다 (0=전체).",
     )
     ap_pipe.add_argument("--no-translate", dest="translate", action="store_false", help="번역 기능을 비활성화하고 원문으로 학습합니다.")
+    ap_pipe.add_argument("--no-embedding", dest="use_embedding", action="store_false", help="Sentence-BERT 대신 TF-IDF 백업 경로를 사용합니다.")
     ap_pipe.set_defaults(translate=True)
+    ap_pipe.set_defaults(use_embedding=True)
     ap_pipe.set_defaults(func=cmd_pipeline)
 
     # chat

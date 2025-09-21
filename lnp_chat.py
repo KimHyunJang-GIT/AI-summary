@@ -69,7 +69,7 @@ class LNPChat:
 
     # 초기화: Retriever 및 번역기 준비
     def ready(self, rebuild: bool = False):
-        spin = Spinner(prefix="인덱스 로딩/점검")
+        spin = Spinner(prefix="인덱스 준비")
         spin.start()
         try:
             self.retr = Retriever(
@@ -77,7 +77,7 @@ class LNPChat:
                 corpus_path=self.corpus_path,
                 cache_dir=self.cache_dir,
             )
-            self.retr.ready(rebuild=rebuild)  # 인덱스 없으면 빌드, 있으면 로드
+            self.retr.ready(rebuild=rebuild, wait=False)
             if self.translate:
                 if GoogleTranslator is None:
                     print("\n⚠️ 경고: 'deep-translator' 라이브러리를 찾을 수 없어 번역 기능이 비활성화됩니다.")
@@ -91,7 +91,10 @@ class LNPChat:
             self.ready_done = True
         finally:
             spin.stop()
-        print("✅ LNP Chat 준비 완료 (번역: " + ("활성" if self.translator else "비활성") + ")")
+        if self.retr.wait_until_ready(timeout=0.1):
+            print("✅ LNP Chat 준비 완료 (번역: " + ("활성" if self.translator else "비활성") + ")")
+        else:
+            print("⏳ 인덱스를 백그라운드에서 준비 중입니다. (번역: " + ("활성" if self.translator else "비활성") + ")")
 
     # 한 턴 처리
     def ask(self, query: str, topk: Optional[int] = None) -> Dict[str, Any]:
@@ -110,10 +113,12 @@ class LNPChat:
                 print(f"\n[경고] 질문 번역 실패. 원본 질문으로 검색합니다. 오류: {e}")
 
         # 스피너로 즉시 “살아있음” 표시
+        index_ready = False
         spin = Spinner(prefix="검색 중")
         spin.start()
         t0 = time.time()
         try:
+            index_ready = self.retr.wait_until_ready(timeout=0.4)
             hits = self.retr.search(query_for_search, top_k=k)
         finally:
             spin.stop()
@@ -132,6 +137,8 @@ class LNPChat:
                 answer_lines.append(f"   {label}: {h['preview']}")
         if not hits:
             answer_lines.append("관련 문서를 찾지 못했습니다. 표현을 바꿔보거나 더 구체적으로 적어주세요.")
+            if not index_ready:
+                answer_lines.append("(인덱스를 준비 중입니다. 잠시 후 다시 시도해주세요.)")
 
         answer = "\n".join(answer_lines)
         self.history.append(ChatTurn(role="assistant", text=answer, hits=hits))

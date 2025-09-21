@@ -1,15 +1,30 @@
 # pipeline.py  (Step2: 추출 + 학습)
+import importlib
+import math
 import os, re, sys, time, threading, platform
+from datetime import datetime
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Union
+
+import numpy as np
 
 # ---- 선택 의존성(있으면 사용) ----
 try:
     import pandas as pd
 except Exception:
     pd = None
+PARQUET_ENGINE: Optional[str] = None
+if pd is not None:
+    for candidate in ("fastparquet", "pyarrow"):
+        try:
+            importlib.import_module(candidate)
+            PARQUET_ENGINE = candidate
+            break
+        except ImportError:
+            continue
 try:
     from deep_translator import GoogleTranslator
 except Exception:
@@ -43,6 +58,10 @@ try:
 except Exception:
     joblib = None
 try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import MiniBatchKMeans
@@ -56,6 +75,19 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+try:
+    import olefile
+except Exception:
+    olefile = None
+try:
+    import pyhwp
+except Exception:
+    pyhwp = None
 
 
 # =========================
@@ -136,6 +168,8 @@ TOKEN_PATTERN = r'(?u)(?:[가-힣]{1,}|[A-Za-z0-9]{2,})'
 DEFAULT_N_COMPONENTS = 128
 MODEL_TEXT_COLUMN = "text_model"
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
+DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
 
 
 def _split_tokens(source: str) -> List[str]:
@@ -144,7 +178,52 @@ def _split_tokens(source: str) -> List[str]:
     return [tok for tok in _META_SPLIT_RE.split(source) if tok]
 
 
-def _metadata_text(path: str, ext: str, drive: str) -> str:
+def _time_tokens(epoch: Optional[float]) -> List[str]:
+    if not epoch:
+        return []
+    try:
+        dt = datetime.fromtimestamp(float(epoch))
+    except Exception:
+        return []
+    parts = [
+        dt.strftime("%Y"),
+        dt.strftime("%Y-%m"),
+        dt.strftime("%Y-%m-%d"),
+        dt.strftime("%B"),
+        dt.strftime("%m"),
+    ]
+    return parts
+
+
+def _size_bucket(size: Optional[int]) -> Optional[str]:
+    if size is None:
+        return None
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    if size < 10 * 1024:
+        return "size:tiny"
+    if size < 1 * 1024 * 1024:
+        return "size:small"
+    if size < 10 * 1024 * 1024:
+        return "size:medium"
+    if size < 50 * 1024 * 1024:
+        return "size:large"
+    return "size:huge"
+
+
+def _metadata_text(
+    path: str,
+    ext: str,
+    drive: str,
+    size: Optional[int] = None,
+    mtime: Optional[float] = None,
+    ctime: Optional[float] = None,
+    owner: Optional[str] = None,
+) -> str:
     tokens: List[str] = []
     if path:
         try:
@@ -176,6 +255,14 @@ def _metadata_text(path: str, ext: str, drive: str) -> str:
         drive_str = str(drive)
         tokens.append(drive_str)
         tokens.extend(_split_tokens(drive_str))
+    for epoch in (mtime, ctime):
+        tokens.extend(_time_tokens(epoch))
+    bucket = _size_bucket(size)
+    if bucket:
+        tokens.append(bucket)
+    if owner:
+        tokens.append(str(owner))
+        tokens.extend(_split_tokens(str(owner)))
 
     seen = set()
     normalized: List[str] = []
@@ -232,9 +319,41 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
     else:
         drives = drives.fillna("").astype(str)
 
+    sizes = df.get("size")
+    if sizes is None:
+        sizes = pd.Series([0] * len(df))
+    else:
+        sizes = sizes.fillna(0)
+
+    mtimes = df.get("mtime")
+    if mtimes is None:
+        mtimes = pd.Series([0.0] * len(df))
+    else:
+        mtimes = mtimes.fillna(0.0)
+
+    ctimes = df.get("ctime")
+    if ctimes is None:
+        ctimes = pd.Series([0.0] * len(df))
+    else:
+        ctimes = ctimes.fillna(0.0)
+
+    owners = df.get("owner")
+    if owners is None:
+        owners = pd.Series([""] * len(df))
+    else:
+        owners = owners.fillna("").astype(str)
+
     base_texts = df["text"].tolist()
     metadata_list = [
-        _metadata_text(paths.iat[idx], exts.iat[idx], drives.iat[idx])
+        _metadata_text(
+            paths.iat[idx],
+            exts.iat[idx],
+            drives.iat[idx],
+            size=sizes.iat[idx],
+            mtime=mtimes.iat[idx],
+            ctime=ctimes.iat[idx],
+            owner=owners.iat[idx],
+        )
         for idx in range(len(df))
     ]
     df[MODEL_TEXT_COLUMN] = [
@@ -298,6 +417,27 @@ class HwpExtractor(BaseExtractor):
                         pythoncom.CoUninitialize()
                     except Exception:
                         pass
+        if olefile and pyhwp:
+            try:
+                from pyhwp.hwp5txt import hwp5txt  # type: ignore
+
+                with olefile.OleFileIO(str(p)) as ole:
+                    buf = io.StringIO()
+                    hwp5txt(ole, buf)
+                    text = buf.getvalue()
+                cleaned = TextCleaner.clean(text)
+                if cleaned:
+                    return {
+                        "ok": True,
+                        "text": cleaned,
+                        "meta": {"engine": "pyhwp", "bytes": p.stat().st_size},
+                    }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "text": "",
+                    "meta": {"error": f"HWP pyhwp 추출 실패: {exc}"},
+                }
         return {
             "ok": False,
             "text": "",
@@ -382,7 +522,10 @@ class ExcelLikeExtractor(BaseExtractor):
                     parts.append(" • "+" | ".join(map(lambda x: str(x), row.tolist())))
             return {"ok":True,"text":TextCleaner.clean("\n".join(parts)),"meta":{"engine":"pandas","sheets":list(sheets.keys())}}
         except Exception as e:
-            return {"ok":False,"text":"","meta":{"error":f"excel/csv read failed: {e}"}}
+            detail = str(e)
+            if "openpyxl" in detail.lower():
+                detail += " (pip install openpyxl)"
+            return {"ok":False,"text":"","meta":{"error":f"excel/csv read failed: {detail}"}}
     @staticmethod
     def _df_to_text(df)->str:
         cols=" | ".join(map(str, df.columns.tolist()))
@@ -407,6 +550,20 @@ class PdfExtractor(BaseExtractor):
                 }
             except Exception:
                 pass
+        if pdfplumber:
+            try:
+                with pdfplumber.open(str(p)) as doc:
+                    pages = [page.extract_text() or "" for page in doc.pages]
+                text = "\n".join(pages)
+                cleaned = TextCleaner.clean(text)
+                if cleaned:
+                    return {
+                        "ok": True,
+                        "text": cleaned,
+                        "meta": {"engine": "pdfplumber", "pages": len(pages)},
+                    }
+            except Exception as exc:
+                return {"ok": False, "text": "", "meta": {"error": f"PDF pdfplumber 실패: {exc}"}}
         if pdfminer_extract_text:
             try:
                 text = pdfminer_extract_text(str(p))
@@ -505,6 +662,8 @@ class ExtractRecord:
     meta: Dict[str, Any]
     size: Optional[int] = None
     mtime: Optional[float] = None
+    ctime: Optional[float] = None
+    owner: Optional[str] = None
 
 class CorpusBuilder:
     MAX_TRANSLATE_CHARS = 4000
@@ -570,6 +729,8 @@ class CorpusBuilder:
                         meta={"error": f"extract crash: {exc}"},
                         size=row.get("size"),
                         mtime=row.get("mtime"),
+                        ctime=row.get("ctime"),
+                        owner=row.get("owner"),
                     )
                 recs[idx] = rec
                 if use_tqdm:
@@ -603,6 +764,8 @@ class CorpusBuilder:
                 {"error":"no extractor"},
                 row.get("size"),
                 row.get("mtime"),
+                row.get("ctime"),
+                row.get("owner"),
             )
         try:
             out=ex.extract(p)
@@ -621,6 +784,8 @@ class CorpusBuilder:
                 out.get("meta",{}),
                 row.get("size"),
                 row.get("mtime"),
+                row.get("ctime"),
+                row.get("owner"),
             )
         except Exception as e:
             return ExtractRecord(
@@ -632,6 +797,8 @@ class CorpusBuilder:
                 {"error":f"extract crash: {e}"},
                 row.get("size"),
                 row.get("mtime"),
+                row.get("ctime"),
+                row.get("owner"),
             )
 
     def _translate_text(self, text: str, *, context: str) -> str:
@@ -691,14 +858,21 @@ class CorpusBuilder:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         ext = out_path.suffix.lower()
         if ext == ".parquet":
+            engine_kwargs = {}
+            engine_label = PARQUET_ENGINE or "auto"
+            if PARQUET_ENGINE:
+                engine_kwargs["engine"] = PARQUET_ENGINE
             try:
-                df.to_parquet(out_path, index=False)
-                print(f"✅ Parquet 저장: {out_path}")
+                df.to_parquet(out_path, index=False, **engine_kwargs)
+                print(f"✅ Parquet 저장({engine_label}): {out_path}")
                 return
             except Exception as e:
                 csv_path = out_path.with_suffix(".csv")
                 df.to_csv(csv_path, index=False, encoding="utf-8")
-                print(f"⚠️ Parquet 엔진 없음 → CSV로 저장: {csv_path}\n   상세: {e}")
+                print(
+                    f"⚠️ Parquet 엔진 실패({engine_label}) → CSV로 저장: {csv_path}\n"
+                    f"   상세: {e}"
+                )
                 return
         df.to_csv(out_path, index=False, encoding="utf-8")
         print(f"✅ CSV 저장: {out_path}")
@@ -719,10 +893,17 @@ def _load_existing_corpus(path: Path) -> Optional["pd.DataFrame"]:
             continue
         try:
             if candidate.suffix.lower() == ".parquet":
-                return pd.read_parquet(candidate)
+                engine_kwargs = {}
+                if PARQUET_ENGINE:
+                    engine_kwargs["engine"] = PARQUET_ENGINE
+                return pd.read_parquet(candidate, **engine_kwargs)
             return pd.read_csv(candidate)
         except Exception as exc:
-            print(f"⚠️ 기존 코퍼스 로드 실패 ({candidate}): {exc}", flush=True)
+            engine_label = PARQUET_ENGINE or "auto"
+            print(
+                f"⚠️ 기존 코퍼스 로드 실패 ({candidate}, engine={engine_label}): {exc}",
+                flush=True,
+            )
     return None
 
 
@@ -785,6 +966,9 @@ class TrainConfig:
     ngram_range: Tuple[int, int] = (1, 2)
     min_df: int = 2
     max_df: float = 0.8
+    use_sentence_transformer: bool = True
+    embedding_model: str = DEFAULT_EMBED_MODEL
+    embedding_batch_size: int = 32
 
 class TopicModel:
     def __init__(self, cfg:TrainConfig):
@@ -833,6 +1017,90 @@ class TopicModel:
         if joblib is None: raise RuntimeError("joblib 필요")
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump({"cfg":self.cfg,"pipeline":self.pipeline}, path)
+
+
+class SentenceBertModel:
+    def __init__(self, cfg: TrainConfig):
+        if SentenceTransformer is None:
+            raise RuntimeError(
+                "sentence-transformers 라이브러리가 필요합니다. pip install sentence-transformers"
+            )
+        self.cfg = cfg
+        self.model_name = cfg.embedding_model or DEFAULT_EMBED_MODEL
+        print(f"🧠 Sentence-BERT 준비: {self.model_name}", flush=True)
+        self._encoder = SentenceTransformer(self.model_name)
+        self.embedding_dim = int(self._encoder.get_sentence_embedding_dimension())
+        self.cluster_model: Optional[MiniBatchKMeans] = None
+        self.cluster_labels_: Optional[np.ndarray] = None
+        self._kmeans_n_init = _resolve_kmeans_n_init()
+
+    def encode(self, texts: List[str], *, show_progress: bool = False) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+        embeddings = self._encoder.encode(
+            texts,
+            batch_size=max(1, int(self.cfg.embedding_batch_size)),
+            show_progress_bar=show_progress,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        )
+        if isinstance(embeddings, list):
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+        return np.asarray(embeddings, dtype=np.float32)
+
+    def fit(self, df, text_col: str = "text") -> np.ndarray:
+        texts = (df[text_col].fillna("").astype(str)).tolist()
+        show_progress = tqdm is not None and len(texts) > 1000
+        embeddings = self.encode(texts, show_progress=show_progress)
+
+        can_cluster = (
+            MiniBatchKMeans is not None
+            and self.cfg.n_clusters > 0
+            and embeddings.shape[0] >= max(10, self.cfg.n_clusters)
+        )
+        if can_cluster:
+            print("🔖 클러스터링: MiniBatchKMeans", flush=True)
+            self.cluster_model = MiniBatchKMeans(
+                n_clusters=self.cfg.n_clusters,
+                random_state=42,
+                batch_size=2048,
+                n_init=self._kmeans_n_init,
+            )
+            self.cluster_model.fit(embeddings)
+            try:
+                labels = self.cluster_model.labels_
+            except AttributeError:
+                labels = self.cluster_model.predict(embeddings)
+            self.cluster_labels_ = np.asarray(labels, dtype=np.int32)
+        else:
+            self.cluster_model = None
+            self.cluster_labels_ = None
+            if MiniBatchKMeans is None:
+                print("⚠️ scikit-learn MiniBatchKMeans 미설치로 토픽 라벨링을 건너뜁니다.", flush=True)
+            elif embeddings.shape[0] < max(10, self.cfg.n_clusters):
+                print("ℹ️ 문서 수가 적어 토픽 클러스터링을 건너뜁니다.", flush=True)
+        return embeddings
+
+    def predict(self, embeddings: np.ndarray) -> np.ndarray:
+        if self.cluster_model is None:
+            raise RuntimeError("클러스터링 모델이 초기화되지 않았습니다.")
+        labels = self.cluster_model.predict(embeddings)
+        return np.asarray(labels, dtype=np.int32)
+
+    def save(self, path: Path) -> None:
+        if joblib is None:
+            raise RuntimeError("joblib 필요. pip install joblib")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "version": 2,
+            "model_type": MODEL_TYPE_SENTENCE_TRANSFORMER,
+            "model_name": self.model_name,
+            "embedding_dim": self.embedding_dim,
+            "train_config": self.cfg,
+        }
+        if self.cluster_model is not None:
+            payload["cluster_model"] = self.cluster_model
+        joblib.dump(payload, path)
 
 
 # =========================
@@ -924,19 +1192,47 @@ def run_step2(file_rows:List[Dict[str,Any]],
             print(f"⚠️ 유효 텍스트 없음. 코퍼스만 저장: {out_corpus}", flush=True)
             return df, None
 
-        tm = TopicModel(cfg)
-        tm.fit(train_df, text_col=text_col)
-        labels = tm.predict(train_df, text_col=text_col)
-        train_df["topic"] = labels
-        df = df.merge(train_df[["path", "topic"]], on="path", how="left")
+        topics_df = None
+        model_obj: Optional[Any] = None
+
+        if cfg.use_sentence_transformer and SentenceTransformer is not None:
+            try:
+                semantic_model = SentenceBertModel(cfg)
+                embeddings = semantic_model.fit(train_df, text_col=text_col)
+                print(
+                    f"✅ Sentence-BERT 임베딩 완료 (docs={embeddings.shape[0]:,}, dim={semantic_model.embedding_dim})",
+                    flush=True,
+                )
+                if semantic_model.cluster_labels_ is not None:
+                    train_df["topic"] = semantic_model.cluster_labels_
+                    topics_df = train_df[["path", "topic"]].copy()
+                model_obj = semantic_model
+            except Exception as exc:
+                print(f"⚠️ Sentence-BERT 학습 실패로 TF-IDF 백업 경로를 사용합니다: {exc}", flush=True)
+        elif cfg.use_sentence_transformer and SentenceTransformer is None:
+            print("⚠️ sentence-transformers 미설치로 TF-IDF 백업 경로를 사용합니다.", flush=True)
+
+        if model_obj is None:
+            tm = TopicModel(cfg)
+            tm.fit(train_df, text_col=text_col)
+            labels = tm.predict(train_df, text_col=text_col)
+            train_df["topic"] = labels
+            topics_df = train_df[["path", "topic"]].copy()
+            model_obj = tm
+
+        if topics_df is not None:
+            df = df.merge(topics_df, on="path", how="left")
 
         CorpusBuilder.save(df, out_corpus)
-        if joblib:
-            tm.save(out_model)
+
+        if isinstance(model_obj, SentenceBertModel):
+            model_obj.save(out_model)
+        elif isinstance(model_obj, TopicModel) and joblib:
+            model_obj.save(out_model)
 
         dt_all = time.time() - t_all
         print(f"💾 저장 완료: corpus → {out_corpus} | model → {out_model}", flush=True)
         print(f"🎉 Step 2 종료 (총 {dt_all:.1f}s)", flush=True)
-        return df, tm
+        return df, model_obj
     finally:
         tqdm = original_tqdm

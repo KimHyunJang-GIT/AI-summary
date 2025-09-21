@@ -7,6 +7,11 @@ import threading
 from pathlib import Path
 from typing import Iterable, List, Dict, Optional
 
+try:
+    import pwd  # POSIX only; optional
+except ImportError:  # pragma: no cover - platform specific
+    pwd = None
+
 class StartupSpinner:
     """아주 이른 단계부터 '살아있음'을 보여주는 콘솔 스피너."""
     FRAMES = ["|", "/", "-", "\\"]
@@ -308,12 +313,15 @@ class FileFinder:
                         if ext in self.exts:
                             try:
                                 st = f.stat()
+                                owner = self._resolve_owner(st)
                                 results.append({
                                     "path": str(f),
                                     "size": st.st_size,
                                     "mtime": st.st_mtime,
+                                    "ctime": st.st_ctime,
                                     "ext": ext,
                                     "drive": f.anchor,
+                                    "owner": owner,
                                 })
                                 with self._lock:
                                     self._matched += 1
@@ -340,7 +348,19 @@ class FileFinder:
         import csv
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["path", "size", "mtime", "ext", "drive"])
+            fieldnames = ["path", "size", "mtime", "ctime", "ext", "drive", "owner"]
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for r in rows:
                 w.writerow(r)
+
+    @staticmethod
+    def _resolve_owner(stat_result) -> str:
+        if not stat_result:
+            return ""
+        if pwd is not None:
+            try:
+                return pwd.getpwuid(stat_result.st_uid).pw_name  # type: ignore[attr-defined]
+            except (KeyError, AttributeError):
+                return ""
+        return ""

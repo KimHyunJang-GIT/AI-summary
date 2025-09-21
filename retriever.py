@@ -1,14 +1,24 @@
 # retriever.py  (Step3: 검색기)
 from __future__ import annotations
-import os, sys, json, time, importlib, types, re
+import os, sys, json, time, importlib, types, re, math, calendar
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Set
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Set, Tuple
+
+from datetime import datetime, timedelta
 
 import numpy as np
+from index_manager import IndexManager
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 MODEL_TEXT_COLUMN = "text_model"
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
+MODEL_TYPE_SENTENCE_TRANSFORMER = "sentence-transformer"
+DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
 def _normalize_ext(ext: str) -> str:
@@ -20,6 +30,17 @@ def _normalize_ext(ext: str) -> str:
     if not ext.startswith('.'):
         ext = f".{ext}"
     return ext
+
+
+def _looks_like_extension(token: str) -> bool:
+    if not token:
+        return False
+    if token.startswith('.'):
+        return True
+    if len(token) > 5:
+        return False
+    ascii_token = token.replace('-', '')
+    return ascii_token.isascii() and ascii_token.isalnum()
 
 
 _DOC_SYNONYMS: Set[str] = {
@@ -94,6 +115,30 @@ _EXT_SYNONYMS: Dict[str, Set[str]] = {
     ".csv": set(_CSV_SYNONYMS),
 }
 
+_DOMAIN_KEYWORDS_BY_EXT: Dict[str, Set[str]] = {}
+for _keyword, _exts in _DOMAIN_EXT_HINTS.items():
+    for _ext in _exts:
+        normalized_ext = _normalize_ext(_ext)
+        if not normalized_ext:
+            continue
+        bucket = _DOMAIN_KEYWORDS_BY_EXT.setdefault(normalized_ext, set())
+        bucket.add(_keyword)
+
+_SEMANTIC_SYNONYMS: Dict[str, Set[str]] = {
+    "보고서": {"report", "document", "summary"},
+    "자료": {"material", "resource", "document"},
+    "계약서": {"contract", "agreement"},
+    "회의록": {"meeting", "minutes", "meeting minutes"},
+    "예산": {"budget", "financial plan"},
+    "발표": {"presentation", "slide", "deck"},
+    "제안서": {"proposal", "pitch", "offer"},
+    "계획": {"plan", "planning"},
+    "정리": {"summary", "overview"},
+}
+
+_LEXICAL_WEIGHT = 0.25
+_EXTENSION_MATCH_BONUS = 0.05
+
 
 def _iter_query_units(lowered: str) -> Set[str]:
     tokens = _split_tokens(lowered)
@@ -147,14 +192,17 @@ def _extract_query_exts(query: str, *, available_exts: Set[str]) -> Set[str]:
 def _prioritize_ext_hits(
     hits: List[Dict[str, Any]], *, desired_exts: Set[str], top_k: int
 ) -> List[Dict[str, Any]]:
-    if not desired_exts:
-        return hits[:top_k]
-    matched = [h for h in hits if _normalize_ext(h.get("ext")) in desired_exts]
-    if len(matched) >= top_k:
-        return matched[:top_k]
-    remaining = [h for h in hits if _normalize_ext(h.get("ext")) not in desired_exts]
-    combined = matched + remaining
-    return combined[:top_k]
+    if not hits:
+        return []
+
+    def _sort_key(entry: Dict[str, Any]) -> tuple:
+        ext = _normalize_ext(entry.get("ext"))
+        in_desired = 1 if ext in desired_exts else 0
+        score = entry.get("score", entry.get("similarity", 0.0))
+        return in_desired, score
+
+    ordered = sorted(hits, key=_sort_key, reverse=True)
+    return ordered[:top_k]
 
 
 def _split_tokens(source: str) -> List[str]:
@@ -163,7 +211,112 @@ def _split_tokens(source: str) -> List[str]:
     return [tok for tok in _META_SPLIT_RE.split(source) if tok]
 
 
-def _metadata_text(path: str, ext: str, drive: str) -> str:
+def _extension_related_tokens(ext: str) -> Set[str]:
+    normalized = _normalize_ext(ext)
+    if not normalized:
+        return set()
+
+    related: Set[str] = set()
+    base = normalized.lstrip(".")
+    if base:
+        related.add(base)
+
+    for keyword in _EXT_SYNONYMS.get(normalized, set()):
+        keyword_norm = keyword.strip().lower()
+        if not keyword_norm:
+            continue
+        related.add(keyword_norm)
+        related.update(_split_tokens(keyword_norm))
+
+    for domain_keyword in _DOMAIN_KEYWORDS_BY_EXT.get(normalized, set()):
+        keyword_norm = domain_keyword.strip().lower()
+        if not keyword_norm:
+            continue
+        related.add(keyword_norm)
+        related.update(_split_tokens(keyword_norm))
+
+    return {tok for tok in related if tok}
+
+
+def _expand_query_text(query: str) -> str:
+    lowered = query.lower()
+    tokens = {tok for tok in _split_tokens(lowered) if tok}
+    expansions: Set[str] = set()
+
+    for token in tokens:
+        ext_token = None
+        if _looks_like_extension(token):
+            ext_token = _normalize_ext(token)
+        if ext_token:
+            expansions.update(_extension_related_tokens(ext_token))
+            continue
+
+        for ext, synonyms in _EXT_SYNONYMS.items():
+            if token in synonyms:
+                expansions.add(ext)
+                expansions.update(_extension_related_tokens(ext))
+
+        if token in _SEMANTIC_SYNONYMS:
+            expansions.update(_SEMANTIC_SYNONYMS[token])
+
+    for keyword, hinted_exts in _DOMAIN_EXT_HINTS.items():
+        if keyword in lowered or keyword in tokens:
+            expansions.add(keyword)
+            for ext in hinted_exts:
+                expansions.update(_extension_related_tokens(ext))
+
+    cleaned_expansions = [word for word in expansions if word and word not in tokens]
+    if not cleaned_expansions:
+        return query
+    return f"{query} {' '.join(sorted(set(cleaned_expansions)))}"
+
+
+def _time_tokens(epoch: Optional[float]) -> List[str]:
+    if not epoch:
+        return []
+    try:
+        dt = datetime.fromtimestamp(float(epoch))
+    except Exception:
+        return []
+    return [
+        dt.strftime("%Y"),
+        dt.strftime("%Y-%m"),
+        dt.strftime("%Y-%m-%d"),
+        dt.strftime("%B"),
+        dt.strftime("%m"),
+    ]
+
+
+def _size_bucket(size: Optional[int]) -> Optional[str]:
+    if size is None:
+        return None
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return None
+    if size < 10 * 1024:
+        return "size:tiny"
+    if size < 1 * 1024 * 1024:
+        return "size:small"
+    if size < 10 * 1024 * 1024:
+        return "size:medium"
+    if size < 50 * 1024 * 1024:
+        return "size:large"
+    return "size:huge"
+
+
+def _metadata_text(
+    path: str,
+    ext: str,
+    drive: str,
+    *,
+    size: Optional[int] = None,
+    mtime: Optional[float] = None,
+    ctime: Optional[float] = None,
+    owner: Optional[str] = None,
+) -> str:
     tokens: List[str] = []
     if path:
         try:
@@ -191,10 +344,19 @@ def _metadata_text(path: str, ext: str, drive: str) -> str:
             ext_no_dot = ext_clean.lstrip(".")
             if ext_no_dot:
                 tokens.append(ext_no_dot)
+            tokens.extend(_extension_related_tokens(ext_clean))
     if drive:
         drive_str = str(drive)
         tokens.append(drive_str)
         tokens.extend(_split_tokens(drive_str))
+    for epoch in (mtime, ctime):
+        tokens.extend(_time_tokens(epoch))
+    bucket = _size_bucket(size)
+    if bucket:
+        tokens.append(bucket)
+    if owner:
+        tokens.append(str(owner))
+        tokens.extend(_split_tokens(str(owner)))
 
     seen = set()
     normalized: List[str] = []
@@ -216,6 +378,78 @@ def _metadata_text(path: str, ext: str, drive: str) -> str:
             seen.add(cleaned)
             normalized.append(cleaned)
     return " ".join(normalized)
+
+
+def _collect_hit_tokens(hit: Dict[str, Any]) -> Set[str]:
+    tokens: Set[str] = set()
+
+    path = hit.get("path")
+    if path:
+        path_text = str(path).lower()
+        tokens.add(path_text)
+        tokens.update(_split_tokens(path_text))
+
+    preview = hit.get("preview")
+    if preview:
+        preview_text = str(preview).lower()
+        tokens.add(preview_text)
+        tokens.update(_split_tokens(preview_text))
+
+    tokens.update(_extension_related_tokens(hit.get("ext", "")))
+    return {tok for tok in tokens if tok}
+
+
+def _lexical_overlap_score(query_tokens: Set[str], hit_tokens: Set[str]) -> float:
+    if not query_tokens or not hit_tokens:
+        return 0.0
+
+    total = 0.0
+    for token in query_tokens:
+        if token in hit_tokens:
+            total += 1.0
+            continue
+
+        for candidate in hit_tokens:
+            if token in candidate or candidate in token:
+                total += 0.5
+                break
+
+    return total / max(len(query_tokens), 1)
+
+
+def _rerank_hits(
+    raw_query: str,
+    expanded_query: str,
+    hits: List[Dict[str, Any]],
+    *,
+    desired_exts: Set[str],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    if not hits:
+        return []
+
+    base_tokens = {tok for tok in _split_tokens(raw_query.lower()) if tok}
+    expanded_tokens = {tok for tok in _split_tokens(expanded_query.lower()) if tok}
+    query_tokens = base_tokens or expanded_tokens
+    synonym_tokens = expanded_tokens - base_tokens
+    scored_hits: List[Dict[str, Any]] = []
+
+    for raw_hit in hits:
+        hit = dict(raw_hit)
+        hit_tokens = _collect_hit_tokens(hit)
+        lexical_score = _lexical_overlap_score(query_tokens, hit_tokens)
+        if synonym_tokens:
+            synonym_score = _lexical_overlap_score(synonym_tokens, hit_tokens)
+            lexical_score = max(lexical_score, synonym_score)
+        base_similarity = float(hit.get("similarity", 0.0))
+        ext = _normalize_ext(hit.get("ext"))
+        ext_bonus = _EXTENSION_MATCH_BONUS if ext in desired_exts else 0.0
+        hit["lexical_score"] = lexical_score
+        hit["score"] = base_similarity + (lexical_score * _LEXICAL_WEIGHT) + ext_bonus
+        scored_hits.append(hit)
+
+    scored_hits.sort(key=lambda item: item.get("score", item.get("similarity", 0.0)), reverse=True)
+    return _prioritize_ext_hits(scored_hits, desired_exts=desired_exts, top_k=top_k)
 
 
 def _compose_model_text(base_text: str, metadata: str) -> str:
@@ -261,9 +495,41 @@ def _prepare_text_frame(df: "pd.DataFrame") -> "pd.DataFrame":
     else:
         drives = drives.fillna("").astype(str)
 
+    sizes = df.get("size")
+    if sizes is None:
+        sizes = pd.Series([0] * len(df))
+    else:
+        sizes = sizes.fillna(0)
+
+    mtimes = df.get("mtime")
+    if mtimes is None:
+        mtimes = pd.Series([0.0] * len(df))
+    else:
+        mtimes = mtimes.fillna(0.0)
+
+    ctimes = df.get("ctime")
+    if ctimes is None:
+        ctimes = pd.Series([0.0] * len(df))
+    else:
+        ctimes = ctimes.fillna(0.0)
+
+    owners = df.get("owner")
+    if owners is None:
+        owners = pd.Series([""] * len(df))
+    else:
+        owners = owners.fillna("").astype(str)
+
     base_texts = df["text"].tolist()
     metadata_list = [
-        _metadata_text(paths.iat[idx], exts.iat[idx], drives.iat[idx])
+        _metadata_text(
+            paths.iat[idx],
+            exts.iat[idx],
+            drives.iat[idx],
+            size=sizes.iat[idx],
+            mtime=mtimes.iat[idx],
+            ctime=ctimes.iat[idx],
+            owner=owners.iat[idx],
+        )
         for idx in range(len(df))
     ]
     df[MODEL_TEXT_COLUMN] = [
@@ -276,6 +542,15 @@ try:
     import pandas as pd
 except Exception:
     pd = None
+PARQUET_ENGINE: Optional[str] = None
+if pd is not None:
+    for candidate in ("fastparquet", "pyarrow"):
+        try:
+            importlib.import_module(candidate)
+            PARQUET_ENGINE = candidate
+            break
+        except ImportError:
+            continue
 
 try:
     import joblib
@@ -328,9 +603,39 @@ class QueryEncoder:
             else:
                 raise
 
-        self.pipeline = obj["pipeline"]
-        self.tfidf = self.pipeline.named_steps["tfidf"]
-        self.svd = self.pipeline.named_steps["svd"]
+        self.model_type = MODEL_TYPE_SENTENCE_TRANSFORMER
+        self.embedding_dim: Optional[int] = None
+        self.embedder: Optional[SentenceTransformer] = None
+        self.pipeline = None
+        self.tfidf = None
+        self.svd = None
+
+        if isinstance(obj, dict) and obj.get("model_type") == MODEL_TYPE_SENTENCE_TRANSFORMER:
+            if SentenceTransformer is None:
+                raise RuntimeError(
+                    "sentence-transformers 라이브러리가 필요합니다. pip install sentence-transformers"
+                )
+            model_name = obj.get("model_name") or DEFAULT_EMBED_MODEL
+            print(f"🔌 Sentence-BERT 로드: {model_name}", flush=True)
+            self.embedder = SentenceTransformer(model_name)
+            detected_dim = obj.get("embedding_dim")
+            if detected_dim:
+                try:
+                    self.embedding_dim = int(detected_dim)
+                except (TypeError, ValueError):
+                    self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+            else:
+                self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+            self.cluster_model = obj.get("cluster_model")
+            self.train_config = obj.get("train_config")
+        else:
+            self.model_type = "tfidf"
+            self.pipeline = obj["pipeline"]
+            self.tfidf = self.pipeline.named_steps["tfidf"]
+            self.svd = self.pipeline.named_steps["svd"]
+            self.embedding_dim = getattr(self.svd, "n_components", None)
+            self.cluster_model = None
+            self.train_config = obj.get("cfg") if isinstance(obj, dict) else None
 
     @staticmethod
     def _sanitize_texts(texts: List[Any]) -> List[str]:
@@ -362,12 +667,40 @@ class QueryEncoder:
 
     def encode_docs(self, texts: List[str]) -> np.ndarray:
         clean_texts = self._sanitize_texts(texts)
+        if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
+            embeddings = self.embedder.encode(
+                clean_texts,
+                batch_size=32,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+            )
+            if isinstance(embeddings, list):
+                embeddings = np.asarray(embeddings, dtype=np.float32)
+            return np.asarray(embeddings, dtype=np.float32)
+
+        if self.tfidf is None or self.svd is None:
+            raise RuntimeError("TF-IDF 파이프라인이 초기화되지 않았습니다.")
         X = self.tfidf.transform(clean_texts)
         Z = self.svd.transform(X)
         return Z.astype(np.float32, copy=False)
 
     def encode_query(self, query: str) -> np.ndarray:
         clean_query = self._sanitize_texts([query])
+        if self.model_type == MODEL_TYPE_SENTENCE_TRANSFORMER and self.embedder is not None:
+            Zq = self.embedder.encode(
+                clean_query,
+                batch_size=8,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+            )
+            if isinstance(Zq, list):
+                Zq = np.asarray(Zq, dtype=np.float32)
+            return np.asarray(Zq, dtype=np.float32)
+
+        if self.tfidf is None or self.svd is None:
+            raise RuntimeError("TF-IDF 파이프라인이 초기화되지 않았습니다.")
         Xq = self.tfidf.transform(clean_query)
         Zq = self.svd.transform(Xq)
         return Zq.astype(np.float32, copy=False)
@@ -387,13 +720,28 @@ class VectorIndex:
         self.paths: List[str] = []
         self.exts: List[str] = []
         self.preview: List[str] = []
+        self.sizes: List[Optional[int]] = []
+        self.mtimes: List[Optional[float]] = []
+        self.ctimes: List[Optional[float]] = []
+        self.owners: List[Optional[str]] = []
 
     @staticmethod
     def _normalize_rows(M: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(M, axis=1, keepdims=True) + 1e-12
         return (M / norms).astype(np.float32, copy=False)
 
-    def build(self, embeddings: np.ndarray, paths: List[str], exts: List[str], preview_texts: List[str]):
+    def build(
+        self,
+        embeddings: np.ndarray,
+        paths: List[str],
+        exts: List[str],
+        preview_texts: List[str],
+        *,
+        sizes: Optional[List[Optional[int]]] = None,
+        mtimes: Optional[List[Optional[float]]] = None,
+        ctimes: Optional[List[Optional[float]]] = None,
+        owners: Optional[List[Optional[str]]] = None,
+    ):
         if embeddings.ndim != 2:
             raise ValueError("embeddings는 2차원이어야 합니다.")
         self.Z = self._normalize_rows(embeddings)
@@ -406,6 +754,18 @@ class VectorIndex:
                 self.preview.append(src[:180] + "…")
             else:
                 self.preview.append(src)
+        total = len(self.paths)
+        def _safe_list(values, fallback=None):
+            if values is None:
+                return [fallback] * total
+            if len(values) != total:
+                raise ValueError("메타데이터 길이가 문서 수와 다릅니다.")
+            return list(values)
+
+        self.sizes = _safe_list(sizes, 0)
+        self.mtimes = _safe_list(mtimes, 0.0)
+        self.ctimes = _safe_list(ctimes, 0.0)
+        self.owners = _safe_list(owners, "")
 
     def save(self, out_dir: Path) -> IndexPaths:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -413,18 +773,46 @@ class VectorIndex:
         meta_path = out_dir / "doc_meta.json"
         if self.Z is None:
             raise RuntimeError("인덱스가 비어있습니다. build() 후 저장하세요.")
-        np.save(emb_path, self.Z)
+        np.save(emb_path, self.Z.astype(np.float32, copy=False))
         with meta_path.open("w", encoding="utf-8") as f:
-            json.dump({"paths": self.paths, "exts": self.exts, "preview": self.preview}, f, ensure_ascii=False)
+            json.dump(
+                {
+                    "paths": self.paths,
+                    "exts": self.exts,
+                    "preview": self.preview,
+                    "sizes": self.sizes,
+                    "mtimes": self.mtimes,
+                    "ctimes": self.ctimes,
+                    "owners": self.owners,
+                },
+                f,
+                ensure_ascii=False,
+            )
         return IndexPaths(emb_npy=emb_path, meta_json=meta_path)
 
-    def load(self, emb_npy: Path, meta_json: Path):
-        self.Z = np.load(emb_npy).astype(np.float32, copy=False)
+    def load(self, emb_npy: Path, meta_json: Path, *, use_mmap: bool = True):
+        mmap_mode = "r" if use_mmap else None
+        self.Z = np.load(emb_npy, mmap_mode=mmap_mode)
+        if self.Z.dtype != np.float32:
+            self.Z = self.Z.astype(np.float32, copy=False)
         with meta_json.open("r", encoding="utf-8") as f:
             meta = json.load(f)
         self.paths = meta["paths"]
         self.exts = meta["exts"]
         self.preview = meta["preview"]
+        total = len(self.paths)
+        self.sizes = meta.get("sizes", [0] * total)
+        self.mtimes = meta.get("mtimes", [0.0] * total)
+        self.ctimes = meta.get("ctimes", [0.0] * total)
+        self.owners = meta.get("owners", [""] * total)
+        if len(self.sizes) != total:
+            self.sizes = [0] * total
+        if len(self.mtimes) != total:
+            self.mtimes = [0.0] * total
+        if len(self.ctimes) != total:
+            self.ctimes = [0.0] * total
+        if len(self.owners) != total:
+            self.owners = [""] * total
         if self.Z.shape[0] != len(self.paths):
             raise RuntimeError("임베딩 행 수와 메타 항목 수가 다릅니다.")
 
@@ -437,58 +825,331 @@ class VectorIndex:
         fetch = max(1, min(len(sims), top_k if oversample <= 1 else top_k * oversample))
         idx = np.argpartition(-sims, kth=fetch - 1)[:fetch]
         idx = idx[np.argsort(-sims[idx])]
-        return [
-            {"path": self.paths[i], "ext": self.exts[i], "similarity": float(sims[i]), "preview": self.preview[i]}
-            for i in idx
-        ]
+        results: List[Dict[str, Any]] = []
+        for i in idx:
+            results.append(
+                {
+                    "path": self.paths[i],
+                    "ext": self.exts[i],
+                    "similarity": float(sims[i]),
+                    "preview": self.preview[i],
+                    "size": self.sizes[i] if i < len(self.sizes) else None,
+                    "mtime": self.mtimes[i] if i < len(self.mtimes) else None,
+                    "ctime": self.ctimes[i] if i < len(self.ctimes) else None,
+                    "owner": self.owners[i] if i < len(self.owners) else None,
+                }
+            )
+        return results
+
+
+# =========================
+# Metadata filters
+# =========================
+
+
+@dataclass
+class MetadataFilters:
+    mtime_from: Optional[float] = None
+    mtime_to: Optional[float] = None
+    ctime_from: Optional[float] = None
+    ctime_to: Optional[float] = None
+    size_min: Optional[int] = None
+    size_max: Optional[int] = None
+    owners: Set[str] = field(default_factory=set)
+
+    def is_active(self) -> bool:
+        return any(
+            value is not None
+            for value in [
+                self.mtime_from,
+                self.mtime_to,
+                self.ctime_from,
+                self.ctime_to,
+                self.size_min,
+                self.size_max,
+            ]
+        ) or bool(self.owners)
+
+    def matches(self, hit: Dict[str, Any]) -> bool:
+        if not self.is_active():
+            return True
+        mtime = _to_float(hit.get("mtime"))
+        ctime = _to_float(hit.get("ctime"))
+        size = _to_int(hit.get("size"))
+        owner = str(hit.get("owner") or "").lower()
+
+        if self.mtime_from is not None and (mtime is None or mtime < self.mtime_from):
+            return False
+        if self.mtime_to is not None and (mtime is None or mtime > self.mtime_to):
+            return False
+        if self.ctime_from is not None and (ctime is None or ctime < self.ctime_from):
+            return False
+        if self.ctime_to is not None and (ctime is None or ctime > self.ctime_to):
+            return False
+        if self.size_min is not None and (size is None or size < self.size_min):
+            return False
+        if self.size_max is not None and (size is None or size > self.size_max):
+            return False
+        if self.owners:
+            if not owner:
+                return False
+            if owner not in self.owners:
+                return False
+        return True
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _year_bounds(year: int) -> Tuple[float, float]:
+    start = datetime(year, 1, 1, 0, 0, 0)
+    end = datetime(year, 12, 31, 23, 59, 59)
+    return start.timestamp(), end.timestamp()
+
+
+def _month_bounds(dt: datetime, months_ago: int = 0) -> Tuple[float, float]:
+    base = _shift_months(dt, months_ago)
+    start = base.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    end = start.replace(day=last_day, hour=23, minute=59, second=59)
+    return start.timestamp(), end.timestamp()
+
+
+def _shift_months(dt: datetime, months: int) -> datetime:
+    year = dt.year
+    month = dt.month - months
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _approx_range(center: float, tolerance_ratio: float = 0.2) -> Tuple[float, float]:
+    delta = center * tolerance_ratio
+    return max(0.0, center - delta), center + delta
+
+
+def _parse_size_expression(value: str, unit: str) -> int:
+    unit = unit.lower()
+    base = float(value)
+    multiplier = {
+        "kb": 1024,
+        "mb": 1024 ** 2,
+        "gb": 1024 ** 3,
+        "tb": 1024 ** 4,
+    }.get(unit, 1)
+    return int(base * multiplier)
+
+
+def _normalize_owner(owner: str) -> str:
+    return owner.strip().lower()
+
+
+def _extract_metadata_filters(query: str) -> MetadataFilters:
+    filters = MetadataFilters()
+    lowered = query.lower()
+    now = datetime.now()
+
+    # Year-based filters (e.g., 2021년)
+    year_match = re.search(r"(20\d{2}|19\d{2})\s*년", query)
+    if year_match:
+        year = int(year_match.group(1))
+        filters.mtime_from, filters.mtime_to = _year_bounds(year)
+
+    # Relative year (e.g., 3년 전)
+    rel_year = re.search(r"(\d+)\s*년\s*전", query)
+    if rel_year:
+        years = int(rel_year.group(1))
+        target_year = now.year - years
+        filters.mtime_from, filters.mtime_to = _year_bounds(target_year)
+
+    if "작년" in lowered:
+        filters.mtime_from, filters.mtime_to = _year_bounds(now.year - 1)
+    if "재작년" in lowered:
+        filters.mtime_from, filters.mtime_to = _year_bounds(now.year - 2)
+    if "올해" in lowered or "올 해" in lowered or "금년" in lowered:
+        filters.mtime_from, filters.mtime_to = _year_bounds(now.year)
+
+    # Month-based filters
+    rel_month = re.search(r"(\d+)\s*개월\s*전", query)
+    if rel_month:
+        months = int(rel_month.group(1))
+        filters.mtime_from, filters.mtime_to = _month_bounds(now, months)
+    if "지난달" in lowered:
+        filters.mtime_from, filters.mtime_to = _month_bounds(now, 1)
+    if "이번달" in lowered or "이 달" in lowered:
+        filters.mtime_from, filters.mtime_to = _month_bounds(now, 0)
+
+    if any(keyword in lowered for keyword in ["최근", "요즘", "요근래", "최근에"]):
+        horizon = now - timedelta(days=180)
+        filters.mtime_from = horizon.timestamp()
+
+    # Size expressions (e.g., 10MB 이상)
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*(kb|mb|gb|tb)\s*(이상|이하|초과|미만|보다 큰|보다 작은)?", lowered):
+        value = match.group(1)
+        unit = match.group(2)
+        qualifier = match.group(3) or ""
+        size_bytes = _parse_size_expression(value, unit)
+        if any(token in qualifier for token in ["이상", "초과", "보다 큰", "at least", "over"]):
+            filters.size_min = max(filters.size_min or 0, size_bytes)
+        elif any(token in qualifier for token in ["이하", "미만", "보다 작은", "at most", "under"]):
+            filters.size_max = min(filters.size_max or size_bytes, size_bytes)
+        else:
+            approx_min, approx_max = _approx_range(size_bytes)
+            filters.size_min = max(filters.size_min or 0, int(approx_min))
+            filters.size_max = min(filters.size_max or int(approx_max), int(approx_max))
+
+    # Owner expressions (작성자 홍길동 / author:alice / @username)
+    for match in re.finditer(r"(?:작성자|author|owner)[:\s]+([\w가-힣@.]+)", query, re.IGNORECASE):
+        filters.owners.add(_normalize_owner(match.group(1)))
+    for mention in re.findall(r"@([\w가-힣._-]+)", query):
+        filters.owners.add(_normalize_owner(mention))
+
+    return filters
+
+
+def _apply_metadata_filters(hits: List[Dict[str, Any]], filters: MetadataFilters) -> List[Dict[str, Any]]:
+    if not filters.is_active():
+        return hits
+    filtered = [hit for hit in hits if filters.matches(hit)]
+    return filtered
+
+
+def _format_human_time(epoch: Any) -> str:
+    value = _to_float(epoch)
+    if value is None or value <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _format_size(size: Any) -> str:
+    num = _to_int(size)
+    if num is None or num <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{num}B"
 
 
 # =========================
 # Retriever
 # =========================
 class Retriever:
-    def __init__(self, model_path: Path, corpus_path: Path, cache_dir: Path = Path("./index_cache")):
+    def __init__(
+        self,
+        model_path: Path,
+        corpus_path: Path,
+        cache_dir: Path = Path("./index_cache"),
+        *,
+        search_wait_timeout: float = 0.5,
+    ):
         self.model_path = Path(model_path)
         self.corpus_path = Path(corpus_path)
         self.cache_dir = Path(cache_dir)
         self.encoder = QueryEncoder(self.model_path)
-        self.index = VectorIndex()
-        self._ready = False
+        self.search_wait_timeout = search_wait_timeout
+        self.index_manager = IndexManager(
+            loader=self._load_cached_index,
+            builder=self._rebuild_index,
+        )
 
-    def ready(self, rebuild: bool = False):
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def ready(self, rebuild: bool = False, *, wait: bool = True) -> bool:
+        if rebuild:
+            self.index_manager.schedule_rebuild(priority=True)
+        else:
+            self.index_manager.ensure_loaded()
+        if wait:
+            self.index_manager.wait_until_ready()
+        return self.index_manager.get_index(wait=False) is not None
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        return self.index_manager.wait_until_ready(timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        index = self.index_manager.get_index(wait=False)
+        if index is None:
+            self.index_manager.ensure_loaded()
+            if not self.index_manager.wait_until_ready(timeout=self.search_wait_timeout):
+                return []
+            index = self.index_manager.get_index(wait=False)
+            if index is None:
+                return []
+
+        available_exts: Set[str] = set()
+        for ext in index.exts:
+            normalized = _normalize_ext(ext)
+            if normalized:
+                available_exts.add(normalized)
+        requested_exts = _extract_query_exts(query, available_exts=available_exts)
+        metadata_filters = _extract_metadata_filters(query)
+        oversample = 4 if requested_exts else 2
+        if metadata_filters.is_active():
+            oversample = max(oversample, 8)
+        vector_query = _expand_query_text(query)
+        q = self.encoder.encode_query(vector_query)
+        raw_hits = index.search(q, top_k=max(top_k, 1), oversample=oversample)
+        filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
+        reranked = _rerank_hits(query, vector_query, filtered_hits, desired_exts=requested_exts, top_k=top_k)
+        return reranked
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _load_cached_index(self) -> Optional[VectorIndex]:
         emb_npy = self.cache_dir / "doc_embeddings.npy"
         meta_json = self.cache_dir / "doc_meta.json"
-        if not rebuild and emb_npy.exists() and meta_json.exists():
-            self.index.load(emb_npy, meta_json)
-            cached_dim = self.index.Z.shape[1] if self.index.Z is not None else 0
-            model_dim = getattr(self.encoder.svd, "n_components", None)
-            if model_dim is None:
-                components = getattr(self.encoder.svd, "components_", None)
-                if components is not None:
-                    model_dim = components.shape[0]
-            if cached_dim and model_dim and cached_dim != model_dim:
-                print(
-                    f"⚠️ 인덱스 차원({cached_dim})과 모델 차원({model_dim})이 달라 재생성합니다."
-                )
-                rebuild = True
-            else:
-                self._ready = True
-                print(f"✅ 인덱스 로드: {self.cache_dir}")
-                return
+        if not emb_npy.exists() or not meta_json.exists():
+            return None
 
+        index = VectorIndex()
+        try:
+            index.load(emb_npy, meta_json, use_mmap=True)
+        except Exception as exc:
+            print(f"⚠️ 인덱스 로드 실패로 재생성을 시도합니다: {exc}")
+            return None
+
+        if not self._index_matches_model(index):
+            print("⚠️ 모델 차수와 인덱스 차수가 달라 재생성을 진행합니다.")
+            return None
+
+        print(f"✅ 인덱스 로드: {self.cache_dir}")
+        return index
+
+    def _rebuild_index(self) -> VectorIndex:
         if pd is None:
             raise RuntimeError("pandas 필요. pip install pandas")
 
-        print("📥 코퍼스 로드…")
-        if self.corpus_path.suffix.lower() == ".parquet":
-            try:
-                df = pd.read_parquet(self.corpus_path)
-            except Exception:
-                df = pd.read_csv(self.corpus_path.with_suffix(".csv"))
-        else:
-            df = pd.read_csv(self.corpus_path)
-
-        df = df.copy()
+        df = self._load_corpus().copy()
         _prepare_text_frame(df)
 
         if MODEL_TEXT_COLUMN not in df.columns:
@@ -503,24 +1164,61 @@ class Retriever:
         Z = self.encoder.encode_docs(work[MODEL_TEXT_COLUMN].tolist())
         preview_series = work["text_original"] if "text_original" in work.columns else work["text"]
         preview_list = preview_series.fillna("").astype(str).tolist()
-        self.index.build(Z, work["path"].tolist(), work["ext"].tolist(), preview_list)
-        paths = self.index.save(self.cache_dir)
-        print(f"💾 인덱스 저장: {paths.emb_npy}, {paths.meta_json}")
-        self._ready = True
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        if not self._ready:
-            self.ready(False)
-        available_exts: Set[str] = set()
-        for ext in self.index.exts:
-            normalized = _normalize_ext(ext)
-            if normalized:
-                available_exts.add(normalized)
-        requested_exts = _extract_query_exts(query, available_exts=available_exts)
-        oversample = 4 if requested_exts else 1
-        q = self.encoder.encode_query(query)
-        raw_hits = self.index.search(q, top_k=max(top_k, 1), oversample=oversample)
-        return _prioritize_ext_hits(raw_hits, desired_exts=requested_exts, top_k=top_k)
+        size_list = work["size"].fillna(0).astype(int).tolist() if "size" in work.columns else [0] * len(work)
+        mtime_list = work["mtime"].fillna(0.0).astype(float).tolist() if "mtime" in work.columns else [0.0] * len(work)
+        ctime_list = work["ctime"].fillna(0.0).astype(float).tolist() if "ctime" in work.columns else [0.0] * len(work)
+        owner_list = work["owner"].fillna("").astype(str).tolist() if "owner" in work.columns else [""] * len(work)
+
+        index = VectorIndex()
+        index.build(
+            Z,
+            work["path"].tolist(),
+            work["ext"].tolist(),
+            preview_list,
+            sizes=size_list,
+            mtimes=mtime_list,
+            ctimes=ctime_list,
+            owners=owner_list,
+        )
+        paths = index.save(self.cache_dir)
+        print(f"💾 인덱스 저장: {paths.emb_npy}, {paths.meta_json}")
+
+        fresh = VectorIndex()
+        fresh.load(paths.emb_npy, paths.meta_json, use_mmap=True)
+        return fresh
+
+    def _load_corpus(self):
+        print("📥 코퍼스 로드…")
+        if self.corpus_path.suffix.lower() == ".parquet":
+            engine_kwargs = {}
+            engine_label = PARQUET_ENGINE or "auto"
+            if PARQUET_ENGINE:
+                engine_kwargs["engine"] = PARQUET_ENGINE
+            try:
+                return pd.read_parquet(self.corpus_path, **engine_kwargs)
+            except Exception as exc:
+                print(
+                    f"⚠️ Parquet 로드 실패(engine={engine_label}): {exc} → CSV로 재시도",
+                    flush=True,
+                )
+                return pd.read_csv(self.corpus_path.with_suffix(".csv"))
+        return pd.read_csv(self.corpus_path)
+
+    def _index_matches_model(self, index: VectorIndex) -> bool:
+        if index.Z is None:
+            return False
+        cached_dim = index.Z.shape[1]
+        model_dim = getattr(self.encoder, "embedding_dim", None)
+        if model_dim is None and getattr(self.encoder, "svd", None) is not None:
+            model_dim = getattr(self.encoder.svd, "n_components", None)
+            if model_dim is None:
+                components = getattr(self.encoder.svd, "components_", None)
+                if components is not None:
+                    model_dim = components.shape[0]
+        if cached_dim and model_dim and cached_dim != model_dim:
+            return False
+        return True
 
     @staticmethod
     def format_results(query: str, results: List[Dict[str, Any]]) -> str:
@@ -529,6 +1227,18 @@ class Retriever:
         lines = [f"‘{query}’와 유사한 문서 Top {len(results)}:"]
         for i, r in enumerate(results, 1):
             lines.append(f"{i}. {r['path']} [{r['ext']}]  유사도={r['similarity']:.2f}")
+            meta_bits: List[str] = []
+            mod_date = _format_human_time(r.get("mtime") or r.get("ctime"))
+            if mod_date:
+                meta_bits.append(f"수정일 {mod_date}")
+            size_label = _format_size(r.get("size"))
+            if size_label:
+                meta_bits.append(size_label)
+            owner = str(r.get("owner") or "").strip()
+            if owner:
+                meta_bits.append(f"작성자 {owner}")
+            if meta_bits:
+                lines.append("   메타: " + ", ".join(meta_bits))
             if r.get("preview"):
                 lines.append(f"   미리보기: {r['preview']}")
         return "\n".join(lines)
