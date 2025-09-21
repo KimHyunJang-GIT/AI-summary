@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import types
 
+import retriever
+
 if "numpy" not in sys.modules:
     np_stub = types.ModuleType("numpy")
     np_stub.ndarray = list
@@ -41,7 +43,12 @@ except ModuleNotFoundError:  # pytest 미설치 환경 대비
 
     pytest = types.SimpleNamespace(mark=_Mark())
 
-from retriever import Retriever, _metadata_text
+from retriever import (
+    Retriever,
+    _metadata_text,
+    _similarity_to_percent,
+    _pick_rerank_device,
+)
 
 
 def _make_stub_retriever() -> Retriever:
@@ -186,3 +193,46 @@ def test_metadata_filters_recognise_relative_year():
     retr.index._hits[5]["mtime"] = now - (6 * 365 * 24 * 3600)
     hits = retr.search("3년 전 작성한 자료", top_k=3)
     assert hits and hits[0]["path"] == "docx_doc"
+
+
+def test_similarity_to_percent_clamps_range():
+    assert _similarity_to_percent(0.873) == "87.3%"
+    assert _similarity_to_percent(1.4) == "100.0%"
+    assert _similarity_to_percent(-0.2) == "0.0%"
+    assert _similarity_to_percent("oops") == "-"
+
+
+def test_pick_rerank_device_prefers_explicit_value():
+    assert _pick_rerank_device("cuda:1") == "cuda:1"
+
+
+def test_pick_rerank_device_uses_cuda_when_available():
+    original_torch = retriever.torch
+
+    class _CudaTorch:
+        class cuda:  # type: ignore
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+    retriever.torch = _CudaTorch()
+    try:
+        assert _pick_rerank_device(None) == "cuda"
+    finally:
+        retriever.torch = original_torch
+
+
+def test_pick_rerank_device_falls_back_to_cpu():
+    original_torch = retriever.torch
+
+    class _CpuTorch:
+        class cuda:  # type: ignore
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+    retriever.torch = _CpuTorch()
+    try:
+        assert _pick_rerank_device(None) == "cpu"
+    finally:
+        retriever.torch = original_torch

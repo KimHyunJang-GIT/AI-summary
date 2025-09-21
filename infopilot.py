@@ -312,7 +312,12 @@ def cmd_chat(args):
         corpus_path=Path(args.corpus),
         cache_dir=Path(args.cache),
         topk=args.topk,
-        translate=args.translate # 번역 옵션 전달
+        translate=args.translate, # 번역 옵션 전달
+        rerank=args.rerank,
+        rerank_model=args.rerank_model,
+        rerank_depth=args.rerank_depth,
+        rerank_batch_size=args.rerank_batch_size,
+        rerank_device=args.rerank_device or None,
     )
     chat_session.ready(rebuild=auto_trained)
 
@@ -423,6 +428,11 @@ def main():
     ap_chat.add_argument("--topk", type=int, default=5)
     ap_chat.add_argument("--no-translate", dest="translate", action="store_false", help="질문 번역 기능을 비활성화합니다.")
     ap_chat.add_argument("--no-auto-train", dest="auto_train", action="store_false", help="자동 학습 갱신을 비활성화합니다.")
+    ap_chat.add_argument("--rerank", action="store_true", help="Cross-Encoder 재랭킹을 활성화합니다 (추가 지연 발생).")
+    ap_chat.add_argument("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", help="재랭킹에 사용할 Cross-Encoder 모델 이름")
+    ap_chat.add_argument("--rerank-depth", type=int, default=80, help="Cross-Encoder 재랭킹에 포함할 후보 문서 수 (50~100 권장)")
+    ap_chat.add_argument("--rerank-batch-size", type=int, default=16, help="Cross-Encoder 추론 배치 크기 (CPU 환경은 8~16 권장)")
+    ap_chat.add_argument("--rerank-device", default=None, help="재랭킹 모델을 로드할 디바이스(e.g. 'cuda', 'cuda:0', 'cpu')")
     ap_chat.set_defaults(translate=True)
     ap_chat.set_defaults(auto_train=True)
     ap_chat.set_defaults(func=cmd_chat)

@@ -15,6 +15,12 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 | 학습 | `python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` | 코퍼스 및 토픽 모델 생성 |
 | 대화 | `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` | 검색 기반 챗봇 실행 (`--no-translate` 옵션 지원) |
 
+파이프라인실행
+python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
+
+
+
+
 ## OS별 설치 및 실행 가이드
 ### macOS
 1. Homebrew 등으로 Python 3.9 이상이 설치되어 있는지 확인 (`python3 --version`).
@@ -55,10 +61,17 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 
 ### Windows (PowerShell)
 1. 64비트 Python 3.9 이상 설치 여부 확인 (`python --version`).
-2. 가상환경 생성 및 활성화:
+단계별 절차 (윈도우 PowerShell 기준)
+
+기존 venv 삭제
+
+Remove-Item .venv -Recurse -Force
+
+
+ 2. 가상환경 생성 및 활성화: 
    ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
+    python -m venv .venv
+   .\.venv\Scripts\Activate.ps1 
    ```
 3. 의존성 설치:
    ```powershell
@@ -93,3 +106,46 @@ AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌�
 ## 문제 해결 팁
 - Parquet 저장 실패 시 `requirements.txt`에 포함된 `fastparquet`가 제대로 설치되었는지 확인하고, 빌드 도구나 네트워크 제한을 점검합니다. 필요한 경우 `pyarrow`와 같은 대체 엔진을 수동으로 설치해도 됩니다.
 - 번역 기능 오류가 발생하면 `deep-translator` 패키지 설치 여부와 외부 네트워크 접근성을 확인하거나 CLI에서 `--no-translate` 옵션으로 비활성화하세요.
+
+깃허브 푸쉬방법
+
+1. Git 상태 확인
+git status
+
+
+→ 수정된 파일/추가된 파일 목록 확인
+
+2. 변경 파일 스테이징
+git add -A
+
+
+(전체 변경 사항을 스테이징)
+
+3. 커밋 생성
+git commit -m "파이프라인 실행 코드 및 테스트 통과 후 정리"
+
+
+→ 메시지는 원하는 걸로 자유롭게 작성 가능
+
+4. 원격 브랜치 확인
+git branch -vv
+
+
+→ 현재 작업 브랜치(main, test1 등)와 연결된 원격(remote/origin) 확인
+
+5. 푸시
+git push origin main
+
+
+만약 현재 브랜치가 main이 아니라면, 예를 들어 test1이라면:
+
+git push origin test1
+
+6. (옵션) 강제 푸시
+
+히스토리가 꼬였거나, 기존 커밋을 덮어써야 하는 경우만:
+
+git push origin main --force
+
+
+⚠️ 하지만 협업 환경에서는 권장하지 않습니다. 본인만 쓰는 저장소일 때만 사용하세요.

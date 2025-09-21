@@ -11,9 +11,15 @@ import numpy as np
 from index_manager import IndexManager
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
 except Exception:
     SentenceTransformer = None
+    CrossEncoder = None
+
+try:
+    import torch
+except Exception:
+    torch = None
 
 MODEL_TEXT_COLUMN = "text_model"
 _META_SPLIT_RE = re.compile(r"[^0-9A-Za-z가-힣]+")
@@ -417,6 +423,117 @@ def _lexical_overlap_score(query_tokens: Set[str], hit_tokens: Set[str]) -> floa
     return total / max(len(query_tokens), 1)
 
 
+def _compose_rerank_document(hit: Dict[str, Any]) -> str:
+    sections: List[str] = []
+    path = str(hit.get("path") or "").strip()
+    if path:
+        sections.append(f"파일 경로: {path}")
+
+    ext = str(hit.get("ext") or "").strip()
+    if ext:
+        sections.append(f"확장자: {ext}")
+
+    drive = str(hit.get("drive") or "").strip()
+    if drive:
+        sections.append(f"드라이브: {drive}")
+
+    owner = str(hit.get("owner") or "").strip()
+    if owner:
+        sections.append(f"작성자: {owner}")
+
+    mtime_label = _format_human_time(hit.get("mtime"))
+    if mtime_label:
+        sections.append(f"수정일: {mtime_label}")
+
+    size_label = _format_size(hit.get("size"))
+    if size_label:
+        sections.append(f"파일 크기: {size_label}")
+
+    preview = str(hit.get("preview") or "").strip()
+    if preview:
+        sections.append(preview)
+
+    return "\n".join(section for section in sections if section)
+
+
+class CrossEncoderReranker:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        device: Optional[str] = None,
+        batch_size: int = 16,
+    ) -> None:
+        if CrossEncoder is None:
+            raise RuntimeError("sentence-transformers의 CrossEncoder를 사용할 수 없습니다.")
+
+        self.model_name = model_name
+        self.device = device or None
+        self.batch_size = max(1, int(batch_size) if batch_size else 1)
+
+        load_kwargs: Dict[str, Any] = {}
+        if self.device:
+            load_kwargs["device"] = self.device
+
+        t0 = time.time()
+        self.model = CrossEncoder(model_name, **load_kwargs)
+        dt = time.time() - t0
+        device_label = self.device or getattr(self.model, "device", "cpu")
+        print(f"✨ 재랭킹 모델 로드 완료: {model_name} (device={device_label}, {dt:.1f}s)")
+
+    def rerank(
+        self,
+        query: str,
+        hits: List[Dict[str, Any]],
+        *,
+        desired_exts: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not hits:
+            return []
+
+        pairs: List[List[str]] = []
+        prepared_hits: List[Dict[str, Any]] = []
+
+        for hit in hits:
+            doc_text = _compose_rerank_document(hit)
+            pairs.append([query, doc_text])
+            prepared_hits.append(dict(hit))
+
+        try:
+            scores = self.model.predict(
+                pairs,
+                batch_size=self.batch_size,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        except Exception as exc:
+            print(f"⚠️ 재랭킹 예측 중 오류가 발생해 기본 점수를 사용합니다: {exc}")
+            return hits
+
+        ext_preferences = desired_exts or set()
+
+        scored: List[Dict[str, Any]] = []
+        for hit, score in zip(prepared_hits, scores.tolist() if hasattr(scores, "tolist") else scores):
+            base_similarity = float(hit.get("similarity", 0.0))
+            if "vector_similarity" not in hit:
+                hit["vector_similarity"] = base_similarity
+            final_score = float(score)
+            ext_bonus = 0.0
+            ext = _normalize_ext(hit.get("ext"))
+            if ext and ext in ext_preferences:
+                ext_bonus = _EXTENSION_MATCH_BONUS
+                final_score += ext_bonus
+            hit["rerank_score"] = float(score)
+            hit["similarity"] = final_score
+            hit["score"] = final_score
+            if ext_bonus:
+                hit["rerank_ext_bonus"] = ext_bonus
+            scored.append(hit)
+
+        scored.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return scored
+
+
 def _rerank_hits(
     raw_query: str,
     expanded_query: str,
@@ -445,6 +562,7 @@ def _rerank_hits(
         ext = _normalize_ext(hit.get("ext"))
         ext_bonus = _EXTENSION_MATCH_BONUS if ext in desired_exts else 0.0
         hit["lexical_score"] = lexical_score
+        hit["vector_similarity"] = base_similarity
         hit["score"] = base_similarity + (lexical_score * _LEXICAL_WEIGHT) + ext_bonus
         scored_hits.append(hit)
 
@@ -1055,6 +1173,28 @@ def _format_size(size: Any) -> str:
     return f"{num}B"
 
 
+def _similarity_to_percent(value: Any, *, decimals: int = 1) -> str:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    score = max(0.0, min(score, 1.0))
+    pct = score * 100.0
+    return f"{pct:.{decimals}f}%"
+
+
+def _pick_rerank_device(requested: Optional[str]) -> str:
+    if requested:
+        return str(requested)
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
+
 # =========================
 # Retriever
 # =========================
@@ -1066,12 +1206,24 @@ class Retriever:
         cache_dir: Path = Path("./index_cache"),
         *,
         search_wait_timeout: float = 0.5,
+        use_rerank: bool = False,
+        rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        rerank_depth: int = 80,
+        rerank_batch_size: int = 16,
+        rerank_device: Optional[str] = None,
     ):
         self.model_path = Path(model_path)
         self.corpus_path = Path(corpus_path)
         self.cache_dir = Path(cache_dir)
         self.encoder = QueryEncoder(self.model_path)
         self.search_wait_timeout = search_wait_timeout
+        depth = max(0, int(rerank_depth))
+        self.rerank_depth = depth
+        self.rerank_model = rerank_model
+        self.rerank_batch_size = max(1, int(rerank_batch_size) if rerank_batch_size else 1)
+        self.rerank_device = rerank_device or None
+        self.use_rerank = bool(use_rerank and depth > 0)
+        self._reranker: Optional[CrossEncoderReranker] = None
         self.index_manager = IndexManager(
             loader=self._load_cached_index,
             builder=self._rebuild_index,
@@ -1117,14 +1269,68 @@ class Retriever:
             oversample = max(oversample, 8)
         vector_query = _expand_query_text(query)
         q = self.encoder.encode_query(vector_query)
-        raw_hits = index.search(q, top_k=max(top_k, 1), oversample=oversample)
+        use_rerank = bool(getattr(self, "use_rerank", False))
+        rerank_depth = int(getattr(self, "rerank_depth", 0) or 0)
+        search_top_k = max(top_k, 1)
+        search_oversample = oversample
+        if use_rerank and rerank_depth:
+            search_top_k = max(search_top_k, rerank_depth)
+            search_oversample = max(1, min(oversample, 2))
+        raw_hits = index.search(q, top_k=search_top_k, oversample=search_oversample)
         filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
-        reranked = _rerank_hits(query, vector_query, filtered_hits, desired_exts=requested_exts, top_k=top_k)
-        return reranked
+        if not filtered_hits:
+            return []
+
+        lexical_limit = max(top_k, 1)
+        if use_rerank and rerank_depth:
+            lexical_limit = max(lexical_limit, min(rerank_depth, len(filtered_hits)))
+
+        lexical_ranking = _rerank_hits(
+            query,
+            vector_query,
+            filtered_hits,
+            desired_exts=requested_exts,
+            top_k=lexical_limit,
+        )
+
+        if not use_rerank:
+            return lexical_ranking[:top_k]
+
+        reranker = self._ensure_reranker()
+        if reranker is None:
+            return lexical_ranking[:top_k]
+
+        reranked = reranker.rerank(query, lexical_ranking, desired_exts=requested_exts)
+        return reranked[:top_k]
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _ensure_reranker(self) -> Optional[CrossEncoderReranker]:
+        if not getattr(self, "use_rerank", False):
+            return None
+        existing = getattr(self, "_reranker", None)
+        if existing is not None:
+            return existing
+
+        if CrossEncoder is None:
+            print("⚠️ CrossEncoder 클래스를 불러올 수 없어 재랭킹을 비활성화합니다.")
+            self.use_rerank = False
+            return None
+
+        try:
+            reranker = CrossEncoderReranker(
+                getattr(self, "rerank_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+                device=_pick_rerank_device(getattr(self, "rerank_device", None)),
+                batch_size=int(getattr(self, "rerank_batch_size", 16) or 16),
+            )
+            self._reranker = reranker
+        except Exception as exc:
+            print(f"⚠️ 재랭킹 모델 로드 실패로 벡터 점수만 사용합니다: {exc}")
+            self.use_rerank = False
+            self._reranker = None
+        return getattr(self, "_reranker", None)
+
     def _load_cached_index(self) -> Optional[VectorIndex]:
         emb_npy = self.cache_dir / "doc_embeddings.npy"
         meta_json = self.cache_dir / "doc_meta.json"
@@ -1226,7 +1432,8 @@ class Retriever:
             return f"“{query}”와 유사한 문서를 찾지 못했습니다."
         lines = [f"‘{query}’와 유사한 문서 Top {len(results)}:"]
         for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r['path']} [{r['ext']}]  유사도={r['similarity']:.2f}")
+            similarity_label = _similarity_to_percent(r.get("similarity", r.get("vector_similarity")))
+            lines.append(f"{i}. {r['path']} [{r['ext']}]  유사도={similarity_label}")
             meta_bits: List[str] = []
             mod_date = _format_human_time(r.get("mtime") or r.get("ctime"))
             if mod_date:

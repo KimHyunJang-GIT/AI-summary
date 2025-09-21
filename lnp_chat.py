@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from retriever import Retriever  # Step3 검색기 재사용
+from retriever import Retriever, _similarity_to_percent  # Step3 검색기 재사용
 
 try:
     from deep_translator import GoogleTranslator
@@ -61,6 +61,11 @@ class LNPChat:
     cache_dir: Path = Path("./index_cache")
     topk: int = 5
     translate: bool = True # 번역 기능 활성화 옵션
+    rerank: bool = False
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_depth: int = 80
+    rerank_batch_size: int = 16
+    rerank_device: Optional[str] = None
 
     retr: Optional[Retriever] = field(init=False, default=None)
     translator: Optional[Any] = field(init=False, default=None)
@@ -76,6 +81,11 @@ class LNPChat:
                 model_path=self.model_path,
                 corpus_path=self.corpus_path,
                 cache_dir=self.cache_dir,
+                use_rerank=self.rerank,
+                rerank_model=self.rerank_model,
+                rerank_depth=self.rerank_depth,
+                rerank_batch_size=self.rerank_batch_size,
+                rerank_device=self.rerank_device,
             )
             self.retr.ready(rebuild=rebuild, wait=False)
             if self.translate:
@@ -130,7 +140,7 @@ class LNPChat:
         # 답변 생성(원본 query 기준)
         answer_lines = [f"‘{query}’에 대한 추천 문서 Top {len(hits)} (검색 {dt:.2f}s):"]
         for i, h in enumerate(hits, 1):
-            sim = f"{h['similarity']:.2f}"
+            sim = _similarity_to_percent(h.get("similarity", h.get("vector_similarity")))
             answer_lines.append(f"{i}. {h['path']} [{h['ext']}]  유사도={sim}")
             if h.get("preview"):
                 label = "미리보기 (원문)" if self.translator else "미리보기"

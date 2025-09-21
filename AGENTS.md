@@ -12,7 +12,7 @@
 - `pip install -r requirements.txt` installs the baseline extractors (번역 기본 활성화를 위한 `deep-translator` 포함).
 - `python infopilot.py scan --out data/found_files.csv` scans mounted drives and writes the discovery CSV.
 - `python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` builds the corpus and updates `data/topic_model.joblib`.
-- `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` launches the retrieval chat; add `--no-translate` if `deep-translator` is unavailable.
+- `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` launches the retrieval chat; add `--no-translate` if `deep-translator` is unavailable. Use `--rerank` (and optional `--rerank-depth`, `--rerank-model`) to enable cross-encoder reranking when higher precision is required.
 
 ## Coding Style & Naming Conventions
 - Follow PEP 8 with 4-space indentation, type hints, and concise docstrings on public entry points.
@@ -23,6 +23,7 @@
 - Adopt `pytest` for new coverage and place specs under `tests/` mirroring module names.
 - Mock filesystem access or use temporary directories when exercising `FileFinder` or `Retriever`.
 - Run `pytest -q` before pushing and rely on synthetic fixture CSVs instead of real customer data.
+- When a project virtualenv uses Python ≥3.12, install dependencies with `pip install -r requirements.txt` (the `pyhwp` extractor is skipped automatically). For environments without GPUs, prefer CPU-only Torch wheels (e.g., `pip install torch --index-url https://download.pytorch.org/whl/cpu`) to avoid downloading large CUDA runtimes.
 
 ## Commit & Pull Request Guidelines
 - Write imperative, present-tense commit subjects (e.g., `Improve PDF extractor handling`) with short context in the body.
