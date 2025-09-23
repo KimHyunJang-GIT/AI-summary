@@ -1,151 +1,87 @@
-# AI-summary
-AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌리기 위한 저장소입니다.
+# InfoPilot: AI 기반 문서 검색 엔진
 
-## 프로젝트 개요
-- `infopilot.py` : `scan → train → chat` 절차를 오케스트레이션하는 CLI 진입점
-- `filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
-- `pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
-- `retriever.py / lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
-- `data/`, `index_cache/` : 생성된 코퍼스와 캐시가 위치하는 디렉터리 (대용량 파일은 커밋 금지)
+InfoPilot은 로컬 PC에 저장된 다양한 형식의 문서(한글, 워드, 파워포인트, PDF, 엑셀 등)를 스캔하고, 그 내용을 기반으로 의미 기반 검색을 수행하는 데스크톱 애플리케이션입니다. 자연어 질의를 통해 사용자가 원하는 문서를 빠르고 정확하게 찾을 수 있도록 돕습니다.
 
-## 핵심 명령
-| 단계 | 명령 | 설명 |
-| --- | --- | --- |
-| 스캔 | `python infopilot.py scan --out data/found_files.csv` | 새/변경 파일 메타데이터 수집 |
-| 학습 | `python infopilot.py train --scan_csv data/found_files.csv --corpus data/corpus.parquet` | 코퍼스 및 토픽 모델 생성 |
-| 대화 | `python infopilot.py chat --model data/topic_model.joblib --corpus data/corpus.parquet --cache index_cache` | 검색 기반 챗봇 실행 (`--no-translate` 옵션 지원) |
+## 주요 기능
 
-파이프라인실행
-python infopilot.py pipeline --corpus data/corpus.parquet --model data/topic_model.joblib
+-   **다양한 문서 형식 지원**: hwp, docx, pptx, pdf, xlsx 등 주요 문서 형식의 텍스트 추출.
+-   **의미 기반 검색**: 자연어 질의를 통해 문서의 의미적 유사도를 분석하여 관련성 높은 문서를 검색.
+-   **학습 데이터 관리**:
+    -   **전체 학습**: PC 전체 드라이브를 스캔하여 새로운 코퍼스(문서 집합)와 벡터 인덱스를 구축.
+    -   **부분 업데이트**: 기존 데이터를 유지한 채, 새로 추가되거나 수정된 파일만 효율적으로 업데이트.
+-   **데스크톱 애플리케이션**: CustomTkinter 기반의 직관적이고 빠른 사용자 인터페이스 제공.
 
+## 프로젝트 구조 설명
 
+InfoPilot 프로젝트는 다음과 같은 주요 디렉토리와 파일로 구성되어 있습니다.
 
+-   `src/`: 애플리케이션의 핵심 로직을 포함합니다.
+    -   `src/config.py`: 모델 이름, 경로, 제외 디렉토리, 지원 확장자 등 모든 전역 설정 변수를 정의합니다.
+    -   `src/core/`: 문서 처리, 인덱싱, 검색 등 핵심 기능을 담당하는 모듈들이 위치합니다.
+        -   `src/core/corpus.py`: 문서에서 텍스트를 추출하고 코퍼스(문서 집합)를 구축하는 로직.
+        -   `src/core/indexing.py`: 구축된 코퍼스를 기반으로 벡터 인덱스를 생성하고 관리하는 로직.
+        -   `src/core/retrieval.py`: 벡터 인덱스를 사용하여 실제 검색 질의를 처리하는 로직.
+        -   `src/core/helpers.py`: 드라이브 목록 가져오기, 질의 파싱 등 공통적으로 사용되는 유틸리티 함수들.
+        -   `src/core/extract.py`: 각 파일 형식별 텍스트 추출기 정의.
+-   `ui/`: 사용자 인터페이스(UI) 관련 코드를 포함합니다.
+    -   `ui/app.py`: 애플리케이션의 메인 진입점이며, CustomTkinter 기반의 주 창과 화면 전환 로직을 관리합니다.
+    -   `ui/screens/`: 애플리케이션의 각 화면(스크린)을 정의하는 모듈들이 위치합니다.
+        -   `ui/screens/home_screen.py`: 앱 시작 시 표시되는 홈 화면.
+        -   `ui/screens/chat_screen.py`: 자연어 질의를 입력하고 검색 결과를 확인하는 채팅 화면.
+        -   `ui/screens/train_screen.py`: 전체 문서 학습 과정을 시작하고 진행 상황을 모니터링하는 화면.
+        -   `ui/screens/update_screen.py`: 기존 데이터를 업데이트하는 과정을 시작하고 모니터링하는 화면.
+-   `data/`: 스캔된 파일 목록(`found_files.csv`), 추출된 문서 코퍼스(`corpus.parquet`) 등 애플리케이션 데이터가 저장됩니다.
+-   `models/`: SentenceTransformer 모델(`LaBSE`) 파일 및 학습 메타 정보(`topic_model.joblib`)가 저장됩니다.
+-   `index_cache/`: 벡터 인덱스 캐시 파일이 저장됩니다.
 
-## OS별 설치 및 실행 가이드
-### macOS
-1. Homebrew 등으로 Python 3.9 이상이 설치되어 있는지 확인 (`python3 --version`).
-2. 가상환경 생성 및 활성화:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-3. 의존성 설치:
-   ```bash
-   python3 -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-4. Parquet 의존성(예: `fastparquet`) 빌드 에러가 나면 Xcode Command Line Tools를 설치하세요.
-   ```bash
-   xcode-select --install
-   ```
-5. 필요 시 명령을 실행합니다 (예: `pytest -q`, `python infopilot.py train ...`).
+## UI 설명 (CustomTkinter)
 
-### Linux / WSL
-1. 필수 빌드 도구 준비(Parquet 가속을 위해 권장):
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y build-essential libsnappy-dev
-   ```
-2. 가상환경 생성 및 활성화:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-3. 의존성 설치:
-   ```bash
-   python3 -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-   *시스템 Python을 그대로 사용할 경우 Debian/Ubuntu는 `--break-system-packages` 옵션이 필요할 수 있습니다.*
-4. 테스트/학습/대화를 필요한 순서대로 실행합니다.
+InfoPilot의 UI는 Python의 `CustomTkinter` 라이브러리를 사용하여 개발되었습니다. 이는 웹 기반 UI(예: Streamlit)와 달리 별도의 웹 서버 없이 독립적인 데스크톱 애플리케이션으로 실행되며, 더 빠르고 안정적인 사용자 경험을 제공합니다.
 
-### Windows (PowerShell)
-1. 64비트 Python 3.9 이상 설치 여부 확인 (`python --version`).
-단계별 절차 (윈도우 PowerShell 기준)
+-   **`ui/app.py`**: 애플리케이션의 메인 창(`ctk.CTk`)을 생성하고, 왼쪽 사이드바에 홈, 채팅, 학습, 업데이트 화면으로 이동하는 내비게이션 버튼을 배치합니다. `select_frame()` 메서드를 통해 각 화면 간의 전환을 관리합니다.
+-   **`ui/screens/` 디렉토리 내 각 화면 모듈**: `ctk.CTkFrame`을 상속받아 각 화면의 고유한 UI 요소와 로직을 구현합니다. `refresh_state()` 메서드를 통해 화면이 활성화될 때마다 최신 데이터 상태를 반영하도록 설계되었습니다.
 
-기존 venv 삭제
+## LaBSE 모델 설치 안내
 
-Remove-Item .venv -Recurse -Force
+InfoPilot은 의미 기반 검색을 위해 `sentence-transformers/LaBSE` 모델을 사용합니다. 이 모델은 애플리케이션 실행 시 자동으로 다운로드되지만, 특정 환경에서는 수동 설치가 필요할 수 있습니다.
 
+### 1. 자동 다운로드 (권장)
 
- 2. 가상환경 생성 및 활성화: 
-   ```powershell
-    python -m venv .venv
-   .\.venv\Scripts\Activate.ps1 
-   ```
-3. 의존성 설치:
-   ```powershell
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-4. `fastparquet` 설치가 실패하면 Microsoft C++ Build Tools를 설치하거나 최신 휠이 포함된 Python 버전을 사용하세요.
-5. 이후 `pytest -q`, `python infopilot.py scan ...` 등 필요한 명령을 순차 실행합니다.
+-   InfoPilot 애플리케이션을 처음 실행하거나, `models/` 디렉토리에 `LaBSE` 모델이 없는 경우, 애플리케이션이 자동으로 Hugging Face Hub에서 모델을 다운로드합니다.
+-   **주의**: 모델 크기(약 500MB)로 인해 초기 다운로드에 시간이 걸릴 수 있으며, 안정적인 인터넷 연결이 필요합니다.
 
-### Windows (Command Prompt)
-1. 가상환경 생성 및 활성화:
-   ```cmd
-   python -m venv .venv
-   .\.venv\Scripts\activate.bat
-   ```
-2. 의존성 설치:
-   ```cmd
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-3. 명령 실행 예시:
-   ```cmd
-   pytest -q
-   python infopilot.py chat --model data\topic_model.joblib --corpus data\corpus.parquet --cache index_cache --no-translate
-   ```
+### 2. 수동 다운로드 및 배치 (선택 사항, 문제 발생 시)
 
-## 테스트 및 검증
-- 모든 플랫폼에서 `pytest -q`로 회귀 테스트를 수행하세요.
-- `tests/conftest.py`가 런타임에 필요한 `JOBLIB_MULTIPROCESSING=0`과 임시 폴더 설정을 제공하므로 추가 환경 변수 설정이 필요 없습니다.
-- 데이터 파이프라인 변경 시 `scan → train`을 재실행한 뒤 캐시 무결성을 확인하고, `chat`에서 결과를 수동 검증하세요.
+네트워크 문제 등으로 자동 다운로드가 어려운 경우, 다음 절차에 따라 모델을 수동으로 다운로드하여 배치할 수 있습니다.
 
-## 문제 해결 팁
-- Parquet 저장 실패 시 `requirements.txt`에 포함된 `fastparquet`가 제대로 설치되었는지 확인하고, 빌드 도구나 네트워크 제한을 점검합니다. 필요한 경우 `pyarrow`와 같은 대체 엔진을 수동으로 설치해도 됩니다.
-- 번역 기능 오류가 발생하면 `deep-translator` 패키지 설치 여부와 외부 네트워크 접근성을 확인하거나 CLI에서 `--no-translate` 옵션으로 비활성화하세요.
+1.  **모델 다운로드**:
+    -   웹 브라우저를 열고 다음 Hugging Face 모델 페이지로 이동합니다: [https://huggingface.co/sentence-transformers/LaBSE](https://huggingface.co/sentence-transformers/LaBSE)
+    -   페이지 상단의 **"Files and versions"** 탭을 클릭합니다.
+    -   모델 파일들(예: `pytorch_model.bin`, `config.json`, `tokenizer.json` 등)을 모두 다운로드합니다. 일반적으로 "Download all files" 옵션이 제공됩니다.
 
-깃허브 푸쉬방법
+2.  **디렉토리 구조 생성**:
+    -   프로젝트 루트 디렉토리(`InfoPilot/`) 아래에 `models/models--sentence-transformers--LaBSE/snapshots/` 경로를 생성합니다.
+    -   다운로드 페이지에서 모델 버전(커밋 해시)을 확인하여 `<commit_hash>` 부분을 대체합니다. (예: `models/models--sentence-transformers--LaBSE/snapshots/5f4e1a.../`)
+    -   **예시 경로**: `InfoPilot/models/models--sentence-transformers--LaBSE/snapshots/5f4e1a.../`
 
-1. Git 상태 확인
-git status
+3.  **파일 배치**:
+    -   다운로드한 모든 모델 파일들을 위에서 생성한 `<commit_hash>` 디렉토리 안에 배치합니다.
 
+## 실행 방법
 
-→ 수정된 파일/추가된 파일 목록 확인
+1.  **의존성 설치:**
+    프로젝트 루트 디렉토리에서 터미널을 열고 다음 명령어를 실행하여 필요한 라이브러리들을 설치합니다.
 
-2. 변경 파일 스테이징
-git add -A
+    ```bash
+    pip install -r requirements.txt
+    pip install hf_xet
+    ```
 
+2.  **애플리케이션 실행:**
+    설치 완료 후, 다음 명령어를 실행하여 InfoPilot 애플리케이션을 시작합니다.
 
-(전체 변경 사항을 스테이징)
+    ```bash
+    python ui/app.py
+    ```
 
-3. 커밋 생성
-git commit -m "파이프라인 실행 코드 및 테스트 통과 후 정리"
-
-
-→ 메시지는 원하는 걸로 자유롭게 작성 가능
-
-4. 원격 브랜치 확인
-git branch -vv
-
-
-→ 현재 작업 브랜치(main, test1 등)와 연결된 원격(remote/origin) 확인
-
-5. 푸시
-git push origin main
-
-
-만약 현재 브랜치가 main이 아니라면, 예를 들어 test1이라면:
-
-git push origin test1
-
-6. (옵션) 강제 푸시
-
-히스토리가 꼬였거나, 기존 커밋을 덮어써야 하는 경우만:
-
-git push origin main --force
-
-
-⚠️ 하지만 협업 환경에서는 권장하지 않습니다. 본인만 쓰는 저장소일 때만 사용하세요.
+    애플리케이션이 실행되면 데스크톱 창이 나타나며, 모든 기능에 접근할 수 있습니다.
