@@ -1,3 +1,0 @@
-2025-09-19 23:09:38 pipeline.py: Resolve MiniBatchKMeans n_init for pre-1.4 scikit-learn while keeping 'auto' when supported.
-2025-09-19 23:09:38 pipeline.py: Restore original tqdm reference after run_step2 toggles progress display.
-2025-09-19 23:09:38 lnp_chat.py: Store assistant answers in history for future context-aware features.
