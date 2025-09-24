@@ -1,0 +1,6 @@
+query,doc_id,relevance
+hello,doc1,3
+hello,doc2,2
+hello,doc3,0
+world,doc5,1
+world,doc6,0

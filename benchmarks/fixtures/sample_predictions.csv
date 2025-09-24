@@ -1,0 +1,6 @@
+query,doc_id,rank,score
+hello,doc2,1,0.92
+hello,doc1,2,0.90
+hello,doc7,3,0.20
+world,doc5,1,0.80
+world,doc8,2,0.10
