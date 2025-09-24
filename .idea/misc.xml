@@ -3,7 +3,9 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.13 (InfoPilot)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.12 (InfoPilot)" project-jdk-type="Python SDK" />
+
+  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.13" project-jdk-type="Python SDK" />
+>>>>>>> recover-mywork
   <component name="PythonCompatibilityInspectionAdvertiser">
     <option name="version" value="3" />
   </component>

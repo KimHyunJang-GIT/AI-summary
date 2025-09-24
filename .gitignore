@@ -1,0 +1,17 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# IDE settings
+.vscode/
+.idea/
+
+# Generated artifacts
+index_cache/
+data/*.csv
+found_files.csv
+
+# Virtual environments
+.venv/
+venv/
+
