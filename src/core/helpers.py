@@ -4,8 +4,10 @@ import os
 import string
 import re
 from pathlib import Path # Path 임포트 추가
+import pandas as pd
+from tqdm import tqdm
 
-from src.config import BASE_EXT_MAP, CORPUS_PARQUET, TOPIC_MODEL_PATH # config에서 필요한 경로 임포트
+from src.config import BASE_EXT_MAP, CORPUS_PARQUET, TOPIC_MODEL_PATH, EXCLUDE_DIRS # config에서 필요한 경로 임포트
 
 # 위치 키워드와 실제 경로 문자열 매핑
 LOCATION_MAP = {
@@ -44,7 +46,7 @@ def parse_query_and_filters(query: str) -> tuple[str, dict]:
 
     # 3. 암시적 확장자 필터 추출 (예: pdf, 엑셀 파일)
     ext_map = {keyword: ext for ext, keywords in BASE_EXT_MAP.items() for keyword in keywords}
-    ext_map.update({ext: ext for ext in BASE_EXT_MAP})
+    ext_map.update({ext: ext for ext in BASE_EXT_MAP}) # 오타 수정
     
     # 직접적인 확장자 (.pdf) 먼저 처리
     direct_ext_pattern = re.compile(r'\.(\w+)\b', re.IGNORECASE)
@@ -79,3 +81,49 @@ def parse_query_and_filters(query: str) -> tuple[str, dict]:
 def have_all_artifacts() -> bool:
     """필수 파일(코퍼스, 모델)이 모두 존재하는지 확인합니다."""
     return CORPUS_PARQUET.exists() and TOPIC_MODEL_PATH.exists()
+
+def _mask_path(file_path: str) -> str:
+    """파일 경로를 사용자 친화적인 형태로 마스킹합니다.
+    예: C:\\Users\\Admin\\Downloads\\document.pdf -> ...\\Downloads\\document.pdf
+    """
+    p = Path(file_path)
+    parts = p.parts
+    if len(parts) > 3: # C:\\Users\\Admin\\... 이상일 경우
+        return "..." + os.sep + os.sep.join(parts[-3:])
+    return file_path
+
+def perform_scan_to_csv(output_path: Path, exts_text: str) -> int:
+    """파일 시스템을 스캔하여 파일 목록과 메타데이터를 CSV로 저장합니다.
+    exts_text: 쉼표로 구분된 확장자 문자열 (예: ".pdf,.docx")
+    """
+    file_rows = []
+    drives = get_drives()
+    current_supported_exts = {e.strip().lower() for e in exts_text.split(",") if e.strip()}
+
+    print(f"🔍 Starting scan on drives: {', '.join(drives)}")
+    print(f"🚫 Excluding directories containing: {', '.join(sorted(list(EXCLUDE_DIRS)))}")
+
+    for drive in drives:
+        print(f"Scanning drive {drive}...")
+        try:
+            for root, dirs, files in tqdm(os.walk(drive, topdown=True), desc=f"Scanning {drive}", unit="files"):
+                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                for file in files:
+                    try:
+                        p = Path(root) / file
+                        if p.suffix.lower() in current_supported_exts and not any(part in EXCLUDE_DIRS for part in p.parts):
+                            stat = p.stat()
+                            file_rows.append({
+                                'path': str(p),
+                                'size': stat.st_size,
+                                'mtime': stat.st_mtime
+                            })
+                    except (FileNotFoundError, PermissionError): continue
+        except PermissionError:
+            print(f"Could not access {drive}. Skipping.")
+            continue
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(file_rows).to_csv(output_path, index=False, encoding='utf-8')
+    print(f"📦 스캔 결과 저장: {output_path} ({len(file_rows)}개 파일)")
+    return len(file_rows)

@@ -1,60 +1,59 @@
 import subprocess
-import os
 import time
-import webview
-import threading
 import sys
+import os
+from pathlib import Path
 
-streamlit_process = None
+# 프로젝트 루트 디렉토리를 sys.path에 추가하여 src 모듈을 임포트할 수 있도록 합니다.
+project_root = Path(__file__).parent
+sys.path.append(str(project_root))
 
-def run_streamlit():
-    """Runs the Streamlit app in a subprocess."""
-    global streamlit_process
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    app_path = os.path.join(project_root, "ui", "app.py")
-    command = ["streamlit", "run", app_path, "--server.headless", "true"]
-    
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NO_WINDOW
+# src.config에서 FastAPI 호스트 및 포트 정보 임포트
+from src.config import FASTAPI_HOST, FASTAPI_PORT
 
-    streamlit_process = subprocess.Popen(command, cwd=project_root, creationflags=creationflags)
+def run_applications():
+    # 현재 실행 중인 Python 인터프리터 경로를 가져옵니다.
+    python_executable = sys.executable
 
-def kill_streamlit():
-    """Terminates the Streamlit server process."""
-    global streamlit_process
-    if streamlit_process:
-        print("Terminating Streamlit server...")
-        if sys.platform == "win32":
-            # Use taskkill on Windows to forcefully terminate the process tree
-            # Redirect output to DEVNULL to suppress success messages
-            subprocess.call(
-                ['taskkill', '/F', '/T', '/PID', str(streamlit_process.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        else:
-            import signal
-            os.killpg(os.getpgid(streamlit_process.pid), signal.SIGTERM)
-        streamlit_process = None
-        print("Streamlit server terminated.")
+    # 환경 변수에 PYTHONIOENCODING=utf-8 추가
+    # 이는 subprocess가 실행될 때 Python의 기본 인코딩을 UTF-8로 설정합니다.
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
 
-if __name__ == '__main__':
-    streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
-    streamlit_thread.start()
+    # 1. FastAPI 백엔드 (Uvicorn) 실행 명령어
+    uvicorn_cmd = [
+        python_executable, 
+        "-m", "uvicorn", 
+        "src.api.main:app", 
+        "--host", FASTAPI_HOST, 
+        "--port", str(FASTAPI_PORT),
+        # "--reload" # 개발용: 코드 변경 시 자동 재시작 (안정성을 위해 임시 제거)
+    ]
+    print(f"🚀 Starting FastAPI backend: {' '.join(uvicorn_cmd)}")
+    # Uvicorn 프로세스를 백그라운드에서 실행합니다. (stdout/stderr는 콘솔로 직접 출력)
+    uvicorn_process = subprocess.Popen(uvicorn_cmd, cwd=project_root, env=env)
 
-    print("Starting Streamlit server, please wait...")
-    time.sleep(8)
+    # 2. FastAPI 서버가 완전히 시작될 때까지 잠시 기다립니다.
+    print("⏳ Waiting for FastAPI backend to start (10 seconds)...") # 대기 시간 10초로 증가
+    time.sleep(10) 
 
-    print("Opening application window.")
-    webview.create_window(
-        'InfoPilot',
-        'http://localhost:8501',
-        width=1280,
-        height=800
-    )
-    
+    # 3. UI 애플리케이션 실행 명령어
+    ui_cmd = [python_executable, "ui/app.py"]
+    print(f"🖥️ Starting UI application: {' '.join(ui_cmd)}")
+    # UI 프로세스를 실행하고, UI가 종료될 때까지 기다립니다.
+    ui_process = subprocess.run(ui_cmd, cwd=project_root, env=env)
+
+    # 4. UI 애플리케이션이 종료되면 FastAPI 백엔드도 종료합니다.
+    print("👋 UI application closed. Terminating FastAPI backend...")
+    uvicorn_process.terminate() # 프로세스 종료 요청
     try:
-        webview.start()
-    finally:
-        kill_streamlit()
+        uvicorn_process.wait(timeout=5) # 5초 동안 프로세스 종료 대기
+        print("✅ FastAPI backend terminated gracefully.")
+    except subprocess.TimeoutExpired:
+        print("⚠️ FastAPI backend did not terminate gracefully. Forcing kill...")
+        uvicorn_process.kill() # 5초 후에도 종료되지 않으면 강제 종료
+        uvicorn_process.wait() # 강제 종료 확인
+        print("❌ FastAPI backend forcefully killed.")
+
+if __name__ == "__main__":
+    run_applications()

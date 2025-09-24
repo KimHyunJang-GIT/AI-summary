@@ -1,84 +1,19 @@
-
 import customtkinter as ctk
 import os
-import pandas as pd
-import time
-import joblib
 import threading
+import requests # requests 라이브러리 임포트
 from pathlib import Path
 
-# Core logic and helpers
-from src.core.helpers import get_drives
+# Core logic and helpers (이제 직접 사용하지 않고 API를 통해 호출)
 from src.config import (
-    EXCLUDE_DIRS, SUPPORTED_EXTS,
     DATA_DIR, MODELS_DIR, CACHE_DIR,
-    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH
+    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH, SUPPORTED_EXTS, FASTAPI_URL # FASTAPI_URL 임포트
 )
-from src.core.corpus import CorpusBuilder
-from src.core.indexing import run_indexing
 
-def _run_full_train_logic(exts_text, do_scan, log_callback, done_callback):
-    try:
-        log_callback("INFO: 필요 디렉토리 생성 중...")
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# FastAPI 백엔드 URL (이제 config.py에서 가져오므로 제거합니다)
+# FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
-        rows = None
-        if do_scan:
-            log_callback("INFO: 드라이브 스캔 시작...")
-            current_supported_exts = {e.strip() for e in exts_text.split(",") if e.strip()}
-            file_list = []
-            for drive in get_drives():
-                log_callback(f"INFO: {drive} 스캔 중...")
-                for root, dirs, files in os.walk(drive, topdown=True):
-                    dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                    for file in files:
-                        try:
-                            p_file = Path(root) / file
-                            if p_file.suffix.lower() in current_supported_exts:
-                                if not any(part in EXCLUDE_DIRS for part in p_file.parts):
-                                    stat = p_file.stat()
-                                    file_list.append({'path': str(p_file), 'size': stat.st_size, 'mtime': stat.st_mtime})
-                        except (FileNotFoundError, PermissionError): continue
-            rows = file_list
-            pd.DataFrame(rows).to_csv(FOUND_FILES_CSV, index=False, encoding="utf-8")
-            log_callback(f"SUCCESS: 스캔 완료. {len(rows):,}개 파일 발견.")
-
-        log_callback("INFO: 텍스트 추출 및 코퍼스 생성 시작...")
-        if CORPUS_PARQUET.exists(): CORPUS_PARQUET.unlink()
-        
-        cb = CorpusBuilder(progress=True)
-        
-        if rows is None and FOUND_FILES_CSV.exists():
-            rows = pd.read_csv(FOUND_FILES_CSV).to_dict("records")
-        
-        if rows:
-            log_callback(f"INFO: {len(rows)}개 파일에서 텍스트를 추출합니다... (진행률은 콘솔 창에 표시됩니다)")
-            df_corpus = cb.build(rows)
-            cb.save(df_corpus, CORPUS_PARQUET)
-            log_callback("SUCCESS: 코퍼스 생성 완료.")
-        else:
-            log_callback("ERROR: 스캔된 파일이 없어 코퍼스를 생성할 수 없습니다.")
-            done_callback()
-            return
-
-        log_callback("INFO: 벡터 인덱싱 시작... (진행률은 콘솔 창에 표시됩니다)")
-        if CORPUS_PARQUET.exists():
-            run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
-            log_callback("SUCCESS: 인덱싱 완료.")
-        else:
-            log_callback("WARNING: 코퍼스 파일이 없어 인덱싱을 건너뜁니다.")
-
-        log_callback("INFO: 학습 메타 정보 저장 중...")
-        meta = {"indexed_at": time.strftime("%Y-%m-%d %H:%M:%S")}
-        joblib.dump(meta, TOPIC_MODEL_PATH)
-        log_callback("🎉 SUCCESS: 모든 학습 과정 완료!")
-
-    except Exception as e:
-        log_callback(f"FATAL: 학습 중 오류 발생 - {e}")
-    finally:
-        done_callback()
+# _run_full_train_logic 함수는 이제 사용하지 않으므로 제거합니다.
 
 class TrainScreen(ctk.CTkFrame):
     def __init__(self, master, start_task_callback, end_task_callback, **kwargs):
@@ -103,7 +38,7 @@ class TrainScreen(ctk.CTkFrame):
         self.scan_checkbox.select()
         self.scan_checkbox.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="w")
 
-        self.start_button = ctk.CTkButton(options_frame, text="▶️ 전체 학습 시작", command=self.start_training)
+        self.start_button = ctk.CTkButton(options_frame, text="▶️ 전체 학습 시작", command=self.start_training_thread)
         self.start_button.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
 
         # --- Log Frame ---
@@ -126,19 +61,58 @@ class TrainScreen(ctk.CTkFrame):
     def _enable_button(self):
         self.start_button.configure(state="normal", text="▶️ 전체 학습 시작")
 
-    def start_training(self):
+    def start_training_thread(self):
+        # UI 응답성을 위해 별도의 스레드에서 API 호출 시작
+        threading.Thread(target=self._start_training_api_calls, daemon=True).start()
+
+    def _start_training_api_calls(self):
         self.start_task_callback() # Notify App that task is starting
-        self.start_button.configure(state="disabled", text="학습 진행 중...")
-        self.log_textbox.configure(state="normal")
-        self.log_textbox.delete("1.0", "end")
-        self.log_textbox.configure(state="disabled")
+        self.after(0, lambda: self.start_button.configure(state="disabled", text="학습 진행 중..."))
+        self.after(0, lambda: self.log_textbox.configure(state="normal"))
+        self.after(0, lambda: self.log_textbox.delete("1.0", "end"))
+        self.after(0, lambda: self.log_textbox.configure(state="disabled"))
 
         exts_text = self.exts_entry.get()
         do_scan = self.scan_checkbox.get() == 1
 
-        train_thread = threading.Thread(
-            target=_run_full_train_logic,
-            args=(exts_text, do_scan, self.log_message, self.training_done)
-        )
-        train_thread.daemon = True
-        train_thread.start()
+        try:
+            if do_scan:
+                self.log_message("INFO: 드라이브 스캔 시작 (API 호출 중)...\n")
+                scan_url = f"{FASTAPI_URL}/scan"
+                scan_payload = {"out": str(FOUND_FILES_CSV), "exts_text": exts_text}
+                scan_response = requests.post(scan_url, json=scan_payload)
+                scan_response.raise_for_status() # HTTP 오류 발생 시 예외 발생
+                scan_data = scan_response.json()
+                if scan_data["status"] == "success":
+                    self.log_message(f"SUCCESS: 스캔 완료. {scan_data["message"]}\n")
+                else:
+                    self.log_message(f"ERROR: 스캔 실패 - {scan_data["message"]}\n")
+                    self.training_done()
+                    return
+            else:
+                self.log_message("INFO: 스캔 건너뛰기.\n")
+
+            self.log_message("INFO: 텍스트 추출 및 코퍼스 생성 시작 (API 호출 중)...\n")
+            train_url = f"{FASTAPI_URL}/train"
+            train_payload = {
+                "scan_csv": str(FOUND_FILES_CSV),
+                "corpus": str(CORPUS_PARQUET),
+                "cache": str(CACHE_DIR)
+            }
+            train_response = requests.post(train_url, json=train_payload)
+            train_response.raise_for_status() # HTTP 오류 발생 시 예외 발생
+            train_data = train_response.json()
+
+            if train_data["status"] == "success":
+                self.log_message(f"SUCCESS: 학습 완료. {train_data["message"]}\n")
+            else:
+                self.log_message(f"ERROR: 학습 실패 - {train_data["message"]}\n")
+
+        except requests.exceptions.ConnectionError:
+            self.log_message(f"FATAL: FastAPI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요: {FASTAPI_URL}\n")
+        except requests.exceptions.RequestException as e:
+            self.log_message(f"FATAL: API 요청 중 오류 발생 - {e}\n")
+        except Exception as e:
+            self.log_message(f"FATAL: 알 수 없는 오류 발생 - {e}\n")
+        finally:
+            self.training_done()

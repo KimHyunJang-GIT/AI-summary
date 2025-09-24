@@ -1,106 +1,20 @@
-
 import customtkinter as ctk
 import os
-import pandas as pd
-import time
-import joblib
-import shutil
 import threading
+import requests # requests 라이브러리 임포트
 from pathlib import Path
 
-# Core logic and helpers
-from src.core.helpers import get_drives, have_all_artifacts
+# Core logic and helpers (이제 직접 사용하지 않고 API를 통해 호출)
+from src.core.helpers import have_all_artifacts
 from src.config import (
-    EXCLUDE_DIRS, SUPPORTED_EXTS,
     DATA_DIR, MODELS_DIR, CACHE_DIR,
-    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH
+    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH, FASTAPI_URL # FASTAPI_URL 임포트
 )
-from src.core.corpus import CorpusBuilder
-from src.core.indexing import run_indexing
 
-def _run_update_index_logic(log_callback, done_callback):
-    try:
-        # 1. 기존 코퍼스 로드 및 유효성 검사
-        if not CORPUS_PARQUET.exists():
-            log_callback("ERROR: 기존 학습 데이터가 없습니다. 전체 학습을 먼저 실행해주세요.")
-            done_callback()
-            return
+# FastAPI 백엔드 URL (이제 config.py에서 가져오므로 제거합니다)
+# FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
-        log_callback("INFO: 기존 데이터 로드 중...")
-        old_df = pd.read_parquet(CORPUS_PARQUET)
-        if old_df.empty or 'mtime' not in old_df.columns or 'size' not in old_df.columns:
-            log_callback("ERROR: 기존 데이터에 파일 메타정보(mtime, size)가 없습니다.")
-            log_callback("INFO: 정확한 업데이트를 위해 [전체 학습]을 먼저 실행해주세요.")
-            done_callback()
-            return
-        log_callback(f"SUCCESS: 기존 데이터 로드 완료. ({len(old_df)}개 파일)")
-
-        # 2. 현재 PC 파일 스캔
-        log_callback("INFO: PC 전체 파일 스캔 중...")
-        current_files_list = []
-        for drive in get_drives():
-            log_callback(f"INFO: {drive} 스캔 중...")
-            for root, dirs, files in os.walk(drive, topdown=True):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-                for file in files:
-                    try:
-                        p_file = Path(root) / file
-                        if p_file.suffix.lower() in SUPPORTED_EXTS:
-                             if not any(part in EXCLUDE_DIRS for part in p_file.parts):
-                                stat = p_file.stat()
-                                current_files_list.append({'path': str(p_file), 'size': stat.st_size, 'mtime': stat.st_mtime})
-                    except (FileNotFoundError, PermissionError): continue
-        current_df = pd.DataFrame(current_files_list)
-        log_callback(f"SUCCESS: PC 스캔 완료. ({len(current_df)}개 파일 발견)")
-
-        # 3. 변경사항 감지
-        log_callback("INFO: 변경사항 감지 중...")
-        old_df_for_merge = old_df[['path', 'size', 'mtime']].copy().rename(columns={'size': 'size_old', 'mtime': 'mtime_old'})
-        current_df_for_merge = current_df[['path', 'size', 'mtime']].copy().rename(columns={'size': 'size_new', 'mtime': 'mtime_new'})
-        merged_df = pd.merge(old_df_for_merge, current_df_for_merge, on='path', how='outer')
-
-        new_files_info = merged_df[merged_df['mtime_old'].isna()][['path', 'size_new', 'mtime_new']].rename(columns={'size_new': 'size', 'mtime_new': 'mtime'}).to_dict('records')
-        deleted_paths = merged_df[merged_df['mtime_new'].isna()]['path'].tolist()
-        modified_files_df = merged_df[merged_df['mtime_old'].notna() & merged_df['mtime_new'].notna() & ((merged_df['mtime_new'] > merged_df['mtime_old']) | (merged_df['size_new'] != merged_df['size_old']))]
-        modified_files_info = modified_files_df[['path', 'size_new', 'mtime_new']].rename(columns={'size_new': 'size', 'mtime_new': 'mtime'}).to_dict('records')
-        log_callback(f"INFO: 신규 {len(new_files_info)}개, 수정 {len(modified_files_info)}개, 삭제 {len(deleted_paths)}개")
-
-        # 4. 코퍼스 업데이트
-        files_to_process = new_files_info + modified_files_info
-        new_extracted_df = pd.DataFrame()
-        if files_to_process:
-            log_callback(f"INFO: {len(files_to_process)}개 파일 텍스트 추출 중... (진행률은 콘솔 창에 표시됩니다)")
-            cb = CorpusBuilder(progress=True)
-            new_extracted_df = cb.build(files_to_process)
-        
-        paths_to_remove = set(deleted_paths) | {f['path'] for f in modified_files_info}
-        updated_old_df = old_df[~old_df['path'].isin(paths_to_remove)].copy()
-        final_corpus_df = pd.concat([updated_old_df, new_extracted_df], ignore_index=True)
-
-        if not final_corpus_df.empty:
-            CorpusBuilder.save(final_corpus_df, CORPUS_PARQUET)
-            log_callback("SUCCESS: 코퍼스 업데이트 완료.")
-        else:
-            log_callback("WARNING: 업데이트 후 코퍼스가 비어있습니다.")
-            if CORPUS_PARQUET.exists(): CORPUS_PARQUET.unlink()
-
-        # 5. 인덱스 재생성
-        if CORPUS_PARQUET.exists() and not pd.read_parquet(CORPUS_PARQUET).empty:
-            log_callback("INFO: 벡터 인덱스 재생성 중... (진행률은 콘솔 창에 표시됩니다)")
-            run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
-            log_callback("SUCCESS: 인덱스 재생성 완료.")
-        else:
-            log_callback("WARNING: 코퍼스가 비어있어 인덱싱을 건너뜁니다.")
-            if CACHE_DIR.exists(): shutil.rmtree(CACHE_DIR); CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-        log_callback("INFO: 메타 정보 저장 중...")
-        joblib.dump({'indexed_at': time.strftime("%Y-%m-%d %H:%M:%S")}, TOPIC_MODEL_PATH)
-        log_callback("🎉 SUCCESS: 모든 업데이트 과정 완료!")
-
-    except Exception as e:
-        log_callback(f"FATAL: 업데이트 중 오류 발생 - {e}")
-    finally:
-        done_callback()
+# _run_update_index_logic 함수는 이제 사용하지 않으므로 제거합니다.
 
 class UpdateScreen(ctk.CTkFrame):
     def __init__(self, master, start_task_callback, end_task_callback, **kwargs):
@@ -115,7 +29,7 @@ class UpdateScreen(ctk.CTkFrame):
         self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=16))
         self.train_button_redirect = ctk.CTkButton(self, text="🚀 전체 학습시키기", command=lambda: master.select_frame("train"))
         self.options_frame = ctk.CTkFrame(self)
-        self.start_button = ctk.CTkButton(self.options_frame, text="▶️ 업데이트 시작", command=self.start_update)
+        self.start_button = ctk.CTkButton(self.options_frame, text="▶️ 업데이트 시작", command=self.start_update_thread)
         self.log_textbox = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="monospace"))
 
         self.refresh_state() # Call refresh_state initially
@@ -133,7 +47,7 @@ class UpdateScreen(ctk.CTkFrame):
 
         if not have_all_artifacts():
             self.grid_rowconfigure(0, weight=1)
-            self.warning_label.configure(text="⚠️ 기존 학습 데이터가 없습니다. 먼저 전체 학습을 실행해주세요.")
+            self.warning_label.configure(text="⚠️ 기존 학습 데이터가 없습니다. 전체 학습을 먼저 실행해주세요.")
             self.warning_label.grid(row=0, column=0, pady=(20, 10))
             self.train_button_redirect.grid(row=1, column=0, pady=10)
         else:
@@ -166,11 +80,38 @@ class UpdateScreen(ctk.CTkFrame):
     def _enable_button(self):
         self.start_button.configure(state="normal", text="▶️ 업데이트 시작")
 
-    def start_update(self):
-        self.start_button.configure(state="disabled", text="업데이트 진행 중...")
-        self.log_textbox.configure(state="normal")
-        self.log_textbox.delete("1.0", "end")
-        self.log_textbox.configure(state="disabled")
+    def start_update_thread(self):
+        # UI 응답성을 위해 별도의 스레드에서 API 호출 시작
+        threading.Thread(target=self._start_update_api_calls, daemon=True).start()
 
-        update_thread = threading.Thread(target=_run_update_index_logic, args=(self.log_message, self.update_done), daemon=True)
-        update_thread.start()
+    def _start_update_api_calls(self):
+        self.start_task_callback() # Notify App that task is starting
+        self.after(0, lambda: self.start_button.configure(state="disabled", text="업데이트 진행 중..."))
+        self.after(0, lambda: self.log_textbox.configure(state="normal"))
+        self.after(0, lambda: self.log_textbox.delete("1.0", "end"))
+        self.after(0, lambda: self.log_textbox.configure(state="disabled"))
+
+        try:
+            self.log_message("INFO: 업데이트 시작 (API 호출 중)...\n")
+            update_url = f"{FASTAPI_URL}/update"
+            update_payload = {
+                "corpus": str(CORPUS_PARQUET),
+                "cache": str(CACHE_DIR)
+            }
+            update_response = requests.post(update_url, json=update_payload)
+            update_response.raise_for_status() # HTTP 오류 발생 시 예외 발생
+            update_data = update_response.json()
+
+            if update_data["status"] == "success":
+                self.log_message(f"SUCCESS: 업데이트 완료. {update_data["message"]}\n")
+            else:
+                self.log_message(f"ERROR: 업데이트 실패 - {update_data["message"]}\n")
+
+        except requests.exceptions.ConnectionError:
+            self.log_message(f"FATAL: FastAPI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요: {FASTAPI_URL}\n")
+        except requests.exceptions.RequestException as e:
+            self.log_message(f"FATAL: API 요청 중 오류 발생 - {e}\n")
+        except Exception as e:
+            self.log_message(f"FATAL: 알 수 없는 오류 발생 - {e}\n")
+        finally:
+            self.update_done()

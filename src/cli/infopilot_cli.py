@@ -104,13 +104,13 @@ def cmd_update(args):
     print(f"현재 파일 스캔 완료. ({len(df_current)}개 파일 발견)")
 
     print("🔄 변경된 파일 분석 중...")
-    df_old.rename(columns={'mtime': 'mtime_old'}, inplace=True)
+    df_old.rename(columns={'mtime': 'mtime_old', 'size': 'size_old'}, inplace=True)
     df_merged = pd.merge(df_current, df_old, on='path', how='outer', suffixes=('', '_old'), indicator=True)
 
     deleted_files = df_merged[df_merged['_merge'] == 'right_only']
     new_files = df_merged[df_merged['_merge'] == 'left_only']
     both_df = df_merged[df_merged['_merge'] == 'both']
-    modified_files = both_df[both_df['mtime'] > both_df['mtime_old']]
+    modified_files = both_df[(both_df['mtime'] > both_df['mtime_old']) | (both_df['size'] != both_df['size_old'])]
 
     print(f"- 신규 파일: {len(new_files)}개")
     print(f"- 수정된 파일: {len(modified_files)}개")
@@ -155,7 +155,7 @@ def cmd_chat(args):
         if query.lower() in {"exit", "quit", "종료"}: print("👋 종료합니다."); break
         cleaned_query, filters = parse_query_and_filters(query)
         print(f"[DEBUG] Cleaned Query: '{cleaned_query}', Filters: {filters}") # 디버깅 로그 추가
-        result = chat_session.ask(cleaned_query, filters=filters)
+        result = chat_session.ask(cleaned_query, filters=filters, use_bm25=args.use_bm25, use_reranker=args.use_reranker)
         print(result["answer"])
         if result.get("suggestions"): 
             print("\n💡 이런 질문은 어떠세요?")
@@ -189,6 +189,8 @@ def main():
     ap_chat.add_argument("--corpus", default=str(CORPUS_PARQUET), help=f"코퍼스 파일 경로 (기본값: {CORPUS_PARQUET})")
     ap_chat.add_argument("--cache", default=str(CACHE_DIR), help=f"인덱스 캐시 디렉토리 (기본값: {CACHE_DIR})")
     ap_chat.add_argument("--topk", type=int, default=DEFAULT_TOP_K, help=f"상위 K개 결과 반환 (기본값: {DEFAULT_TOP_K})")
+    ap_chat.add_argument("--use-bm25", action="store_true", help="BM25 검색을 활성화합니다.")
+    ap_chat.add_argument("--use-reranker", action="store_true", help="재랭킹을 활성화합니다.")
     ap_chat.set_defaults(func=cmd_chat)
 
     args = ap.parse_args()

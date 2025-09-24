@@ -98,3 +98,23 @@ CACHE_DIR = PROJECT_ROOT / "index_cache"
 FOUND_FILES_CSV = DATA_DIR / "found_files.csv"
 CORPUS_PARQUET = DATA_DIR / "corpus.parquet"
 TOPIC_MODEL_PATH = MODELS_DIR / "topic_model.joblib"
+
+
+# ===================================
+# 5. FastAPI 서버 설정
+# ===================================
+FASTAPI_HOST = "localhost" # 127.0.0.1 대신 localhost 사용
+FASTAPI_PORT = 8001 # 포트 8000에서 8001로 변경
+FASTAPI_URL = f"http://{FASTAPI_HOST}:{FASTAPI_PORT}"
+
+# ===================================
+# 6. Gemini API 설정
+# ===================================
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY" # 여기에 실제 Gemini API 키를 입력하세요. (예: os.getenv("GEMINI_API_KEY"))
+
+# ===================================
+# 7. 로컬 LLM 설정 (Hugging Face)
+# ===================================
+USE_LOCAL_LLM = True # 로컬 LLM을 사용하려면 True로 설정, Gemini를 사용하려면 False로 설정
+LOCAL_LLM_MODEL_NAME = "skt/kogpt2-base-v2" # 사용할 Hugging Face 모델 이름 (예: "gpt2", "distilgpt2", "facebook/opt-125m")
+LOCAL_LLM_MAX_NEW_TOKENS = 100 # 로컬 LLM이 생성할 최대 토큰 수

@@ -164,6 +164,15 @@ class CorpusBuilder:
                 success_path = output_dir / "corpus_success.csv"
                 failure_path = output_dir / "corpus_failure.csv"
                 df_success.to_csv(success_path, index=False, encoding="utf-8")
-                df_failure.to_csv(failure_path, index=False, encoding="utf-8")
+                
+                # Handle corpus_failure.csv: merge existing with new failures
+                if failure_path.exists():
+                    df_existing_failure = pd.read_csv(failure_path)
+                    df_combined_failure = pd.concat([df_existing_failure, df_failure], ignore_index=True)
+                    df_combined_failure.drop_duplicates(subset=['path'], inplace=True)
+                    df_combined_failure.to_csv(failure_path, index=False, encoding="utf-8")
+                else:
+                    df_failure.to_csv(failure_path, index=False, encoding="utf-8")
+
         except Exception as e:
             sys.stderr.write(f"[ERROR] An error occurred while saving success/failure CSV files: {e}\n")

@@ -1,17 +1,31 @@
+# src: InfoPilot 핵심 로직 및 백엔드
 
-# infopilot_split
+이 디렉토리에는 InfoPilot 애플리케이션의 핵심 로직과 FastAPI 기반의 백엔드 API가 포함되어 있습니다. 기존의 모놀리식 구조에서 클라이언트-서버 아키텍처로 전환됨에 따라, `src/api` 디렉토리가 추가되어 모든 핵심 기능이 RESTful API 엔드포인트를 통해 노출됩니다.
 
-원본 파일을 실제로 분해하여 역할별 모듈로 구성했습니다.
-- 일부 심볼은 원본으로부터 **코드 블록을 추출**하여 파일에 직접 포함했고,
-- 찾을 수 없는 심볼은 **원본에서 임시 재수출**(fallback)했습니다.
+## 주요 변경사항 및 아키텍처
+
+-   **클라이언트-서버 아키텍처**: `src/api` 디렉토리에 FastAPI 백엔드가 구현되어 UI 클라이언트(`ui/`) 및 다른 서비스들이 HTTP 요청을 통해 InfoPilot의 기능을 활용할 수 있게 되었습니다.
+-   **중앙 집중식 설정**: `src/config.py` 파일에서 FastAPI 서버의 호스트 및 포트 정보와 같은 전역 설정 변수들을 관리하여 일관성과 유지보수성을 높였습니다.
+-   **모듈화 및 역할 분리**: 각 모듈의 역할이 더욱 명확해졌으며, 특히 `src/core/helpers.py`에 파일 시스템 스캔 로직이 추가되어 유틸리티 기능이 강화되었습니다.
 
 ## 구조
-- core/file_finder.py — FileFinder, StartupSpinner
-- core/extract.py — TextCleaner, BaseExtractor, HwpExtractor, DocxExtractor, PdfExtractor, PptxExtractor, simple_summary
-- core/corpus.py — ExtractRecord, CorpusBuilder
-- core/indexing.py — run_indexing
-- core/index_store.py — IndexPaths, VectorIndex
-- core/retrieval.py — Retriever
-- app/chat.py — ChatTurn, LNPChat
-- app/paths.py — 공통 경로/아티팩트 체크
-- cli/infopilot_cli.py — cmd_scan, cmd_train, cmd_chat, main
+
+-   `src/config.py`: 모델 이름, 경로, 제외 디렉토리, 지원 확장자 등 모든 전역 설정 변수를 정의합니다. **FastAPI 서버의 호스트 및 포트 정보도 이곳에서 중앙 관리됩니다.**
+
+-   `src/api/`: **FastAPI 기반의 백엔드 API를 정의합니다.** UI 클라이언트 및 외부 서비스가 InfoPilot의 핵심 기능(스캔, 학습, 업데이트, 채팅)에 접근할 수 있는 RESTful 엔드포인트를 제공합니다.
+    -   `src/api/main.py`: FastAPI 애플리케이션의 메인 진입점이며, 각 기능별 API 엔드포인트를 정의합니다.
+
+-   `src/core/`: 문서 처리, 인덱싱, 검색 등 핵심 기능을 담당하는 모듈들이 위치합니다.
+    -   `src/core/corpus.py`: 문서에서 텍스트를 추출하고 코퍼스(문서 집합)를 구축하는 로직. **실패한 파일 추출 기록을 누적 관리하는 기능이 개선되었습니다.**
+    -   `src/core/indexing.py`: 구축된 코퍼스를 기반으로 벡터 인덱스를 생성하고 관리하는 로직.
+    -   `src/core/retrieval.py`: 벡터 인덱스를 사용하여 실제 검색 질의를 처리하는 로직. **BM25 키워드 검색 및 교차 인코더(Cross-Encoder) 기반 재랭킹 옵션이 추가되어 검색 정확도를 높였습니다.**
+    -   `src/core/helpers.py`: 드라이브 목록 가져오기, 질의 파싱 등 공통적으로 사용되는 유틸리티 함수들. **파일 시스템 스캔 로직(`perform_scan_to_csv`)이 추가되었습니다.**
+    -   `src/core/extract.py`: 각 파일 형식별 텍스트 추출기 정의.
+    -   `src/core/index_store.py`: 벡터 인덱스(예: Faiss)의 저장 및 로드, 검색 기능을 추상화한 모듈.
+    -   `src/core/utils.py`: 스피너(Spinner) 등 애플리케이션 전반에 걸쳐 사용되는 일반 유틸리티 함수들.
+    -   `src/core/query_parser.py`: 사용자 질의를 분석하고 필터를 추출하는 로직.
+
+-   `src/app/`: 애플리케이션의 주요 기능 모듈을 포함합니다.
+    -   `src/app/chat.py`: 채팅 인터페이스와 관련된 핵심 로직을 담당합니다. **번역 캐시 주입 및 질의 기록 기반 가중치 공유를 위한 인터페이스가 정비되었습니다.**
+
+-   `src/cli/`: 커맨드 라인 인터페이스(CLI) 관련 코드를 포함합니다. **주요 기능은 FastAPI 백엔드 API를 통해 노출되므로, CLI는 주로 개발 및 테스트 목적으로 사용될 수 있습니다. `cmd_scan` 함수는 `src/core/helpers.py`의 `perform_scan_to_csv` 함수를 활용하도록 변경되었습니다.**
