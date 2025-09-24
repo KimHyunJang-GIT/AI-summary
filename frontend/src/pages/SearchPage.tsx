@@ -8,6 +8,8 @@ import {
   type SearchHit,
   type SessionSummary,
   type FeedbackAction,
+  type ChatMessage,
+  type AnswerSource,
 } from "../api/client";
 
 const UI_EVENT_KEY = "infopilot_ui_events";
@@ -41,6 +43,9 @@ export const SearchPage: React.FC = () => {
   const [preferredExts, setPreferredExts] = useState<string[]>([]);
   const [ownerPrior, setOwnerPrior] = useState<string[]>([]);
   const [results, setResults] = useState<SearchHit[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [answerSource, setAnswerSource] = useState<AnswerSource>("none");
+  const [llmError, setLlmError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,6 +58,9 @@ export const SearchPage: React.FC = () => {
       if (res.session_id ?? null) {
         setSessionId(res.session_id ?? null);
       }
+      setChatHistory(res.history ?? []);
+      setAnswerSource(res.answer_source ?? "none");
+      setLlmError(res.llm_error ?? null);
       const summary: SessionSummary | undefined = res.session;
       if (summary) {
         setRecentQueries(summary.recent_queries ?? []);
@@ -105,6 +113,9 @@ export const SearchPage: React.FC = () => {
     setPreferredExts([]);
     setOwnerPrior([]);
     setResults([]);
+    setChatHistory(res.history ?? []);
+    setAnswerSource("none");
+    setLlmError(null);
   };
 
   const handleReindex = async () => {
@@ -181,6 +192,47 @@ export const SearchPage: React.FC = () => {
         {error && <div className="text-red-600 text-sm">{error}</div>}
       </header>
       <main className="grid gap-3">
+        {chatHistory.length > 0 && (
+          <section className="space-y-2 bg-white border rounded-lg shadow-sm p-4">
+            <div className="text-sm font-semibold text-gray-600">대화 기록</div>
+            <div className="space-y-3">
+              {chatHistory.map((msg, idx) => {
+                const isAssistant = msg.role === "assistant";
+                return (
+                  <div
+                    key={`${msg.role}-${idx}`}
+                    className={`flex ${isAssistant ? "justify-start" : "justify-end"}`}
+                  >
+                    <div
+                      className={`max-w-3xl whitespace-pre-wrap rounded-lg px-3 py-2 text-sm leading-relaxed ${
+                        isAssistant
+                          ? "bg-indigo-50 border border-indigo-100 text-indigo-900"
+                          : "bg-gray-100 border border-gray-200 text-gray-800"
+                      }`}
+                    >
+                      {msg.text}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <span>응답 모드:</span>
+              <span className="font-medium">
+                {answerSource === "llm"
+                  ? "LLM 생성"
+                  : answerSource === "fallback"
+                  ? "검색 기반 기본 응답"
+                  : "응답 없음"}
+              </span>
+            </div>
+            {llmError && (
+              <div className="text-xs text-red-500">
+                LLM 호출에 실패하여 기본 응답을 표시했습니다. (원인: {llmError})
+              </div>
+            )}
+          </section>
+        )}
         {results.map((hit, idx) => (
           <ResultCard
             key={`${hit.path}-${idx}`}

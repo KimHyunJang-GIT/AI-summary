@@ -34,11 +34,22 @@ export interface SessionSummary {
   owner_prior: string[];
 }
 
+export type AnswerSource = "llm" | "fallback" | "none";
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
 export interface SearchResponse {
   session_id?: string | null;
   results: SearchHit[];
   explain: string[][];
   session: SessionSummary;
+  answer?: string | null;
+  answer_source: AnswerSource;
+  history: ChatMessage[];
+  llm_error?: string | null;
 }
 
 export interface FeedbackResponse {
@@ -50,6 +61,7 @@ export interface FeedbackResponse {
 export interface SessionResetResponse {
   session_id?: string | null;
   recent_queries: string[];
+  history: ChatMessage[];
 }
 
 export interface ReindexResponse {

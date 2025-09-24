@@ -78,6 +78,7 @@ MAX_PREVIEW_CHARS = 180
 DEFAULT_MMR_LAMBDA = 0.7
 RRF_DEFAULT_K = 60
 _SESSION_HISTORY_LIMIT = 50
+_SESSION_CHAT_HISTORY_LIMIT = 20
 _SESSION_PREF_DECAY = 0.85
 _SESSION_CLICK_WEIGHT = 0.35
 _SESSION_PIN_WEIGHT = 0.6
@@ -331,11 +332,23 @@ class SessionState:
     clicked_doc_ids: Set[int] = field(default_factory=set)
     preferred_exts: Dict[str, float] = field(default_factory=dict)
     owner_prior: Dict[str, float] = field(default_factory=dict)
+    chat_history: Deque[Tuple[str, str]] = field(
+        default_factory=lambda: deque(maxlen=_SESSION_CHAT_HISTORY_LIMIT)
+    )
 
     def add_query(self, query: str) -> None:
         if not query:
             return
         self.recent_queries.append(query)
+
+    def record_user_message(self, message: str) -> None:
+        self._append_chat_turn("user", message)
+
+    def record_assistant_message(self, message: str) -> None:
+        self._append_chat_turn("assistant", message)
+
+    def get_chat_history(self) -> List[Tuple[str, str]]:
+        return list(self.chat_history)
 
     def record_click(
         self,
@@ -398,6 +411,13 @@ class SessionState:
             store.pop(key, None)
         else:
             store[key] = updated
+
+    def _append_chat_turn(self, role: str, message: str) -> None:
+        text = (message or "").strip()
+        if not text:
+            return
+        normalized_role = role if role in {"user", "assistant"} else "assistant"
+        self.chat_history.append((normalized_role, text))
 
 @dataclass
 class EarlyStopConfig:
