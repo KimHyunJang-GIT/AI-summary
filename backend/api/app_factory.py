@@ -16,6 +16,7 @@ from .schemas import (
     SessionResetResponse,
     SessionSummary,
 )
+from .llm_service import LLMService
 from .session import registry
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ def create_app(
         # cleanup placeholder
 
     app = FastAPI(title="AI Summary Retriever", lifespan=lifespan)
+    llm_service = LLMService.from_settings(settings)
 
     def _ensure_retriever(request: Request):
         retriever = request.app.state.retriever
@@ -73,19 +75,36 @@ def create_app(
 
     @app.post("/api/search", response_model=SearchResponse)
     def search(req: SearchRequest, retr=Depends(_ensure_retriever)) -> SearchResponse:
-        session_state = registry.get(req.session_id)
+        session_id, session_state = registry.get_or_create(req.session_id)
+        prior_history = session_state.get_chat_history()
         hits = retr.search(req.query, top_k=req.top_k, session=session_state)
+        answer, used_llm, llm_error = llm_service.generate_reply(
+            user_message=req.query,
+            conversation=prior_history,
+            hits=hits,
+        )
+        session_state.record_user_message(req.query)
+        if answer:
+            session_state.record_assistant_message(answer)
         summary = _build_session_summary(session_state)
+        history_payload = [
+            {"role": role, "text": text} for role, text in session_state.get_chat_history()
+        ]
+        answer_source = "llm" if used_llm and answer else "fallback" if answer else "none"
         return SearchResponse(
-            session_id=req.session_id,
+            session_id=session_id,
             results=hits,
             explain=[hit.get("match_reasons", []) for hit in hits],
             session=summary,
+            answer=answer,
+            answer_source=answer_source,
+            history=history_payload,
+            llm_error=llm_error,
         )
 
     @app.post("/api/feedback", response_model=FeedbackResponse)
     def feedback(req: FeedbackRequest) -> FeedbackResponse:
-        session_state = registry.get(req.session_id)
+        session_id, session_state = registry.get_or_create(req.session_id)
         action = (req.action or "").lower().strip()
         if action not in {"click", "pin", "like", "dislike"}:
             raise HTTPException(status_code=400, detail=f"unsupported action {req.action}")
@@ -102,14 +121,16 @@ def create_app(
         elif action == "dislike":
             session_state.record_dislike(ext=req.ext, owner=req.owner)
         summary = _build_session_summary(session_state)
-        return FeedbackResponse(session_id=req.session_id, status="ok", session=summary)
+        return FeedbackResponse(session_id=session_id, status="ok", session=summary)
 
     @app.post("/api/session/reset", response_model=SessionResetResponse)
     def reset_session(req: FeedbackRequest) -> SessionResetResponse:
-        state = registry.reset(req.session_id)
+        session_id, state = registry.reset(req.session_id)
         summary = _build_session_summary(state)
         return SessionResetResponse(
-            session_id=req.session_id, recent_queries=summary.recent_queries
+            session_id=session_id,
+            recent_queries=summary.recent_queries,
+            history=[],
         )
 
     @app.post("/api/reindex", response_model=ReindexResponse)

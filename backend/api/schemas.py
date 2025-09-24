@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SearchRequest(BaseModel):
@@ -17,11 +17,20 @@ class SessionSummary(BaseModel):
     owner_prior: List[str]
 
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+
 class SearchResponse(BaseModel):
     session_id: Optional[str]
     results: List[dict]
     explain: List[List[str]]
     session: SessionSummary
+    answer: Optional[str] = None
+    answer_source: Literal["llm", "fallback", "none"] = "none"
+    history: List[ChatMessage] = Field(default_factory=list)
+    llm_error: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -50,3 +59,4 @@ class ReindexResponse(BaseModel):
 class SessionResetResponse(BaseModel):
     session_id: Optional[str]
     recent_queries: List[str]
+    history: List[ChatMessage] = Field(default_factory=list)

@@ -10,6 +10,10 @@ def test_search_endpoint_returns_results(client):
     data = resp.json()
     assert "results" in data
     assert "session" in data
+    assert "answer" in data
+    assert data["answer_source"] in {"llm", "fallback", "none"}
+    assert isinstance(data.get("history"), list)
+    assert data.get("history") and data["history"][-1]["role"] == "assistant"
 
 
 @pytest.mark.smoke
